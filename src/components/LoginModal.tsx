@@ -1,5 +1,5 @@
-import React, { useState, useMemo } from 'react';
-import { X, Mail, Lock, Chrome, ArrowRight, Loader2, User, Phone, MapPin, Eye, EyeOff, ShieldCheck } from 'lucide-react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
+import { X, Mail, Lock, Chrome, ArrowRight, Loader2, User, Phone, MapPin, Eye, EyeOff, ShieldCheck, Clock, KeyRound } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { supabase } from '../supabase';
 
@@ -68,6 +68,42 @@ function InputField({
   );
 }
 
+// ─── Ban thresholds ────────────────────────────────────────────────────────────
+const BAN_RULES: { attempts: number; seconds: number }[] = [
+  { attempts: 3, seconds: 60 },   // 3 failed attempts → 60 seconds
+  { attempts: 5, seconds: 90 },   // 5 failed attempts → 1 minute 30 seconds
+];
+
+function getBanDuration(failCount: number): number {
+  // Return ban in milliseconds for the highest matching rule
+  let ms = 0;
+  for (const rule of BAN_RULES) {
+    if (failCount >= rule.attempts) {
+      ms = rule.seconds * 1000;
+    }
+  }
+  return ms;
+}
+
+function formatBanDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds} second${seconds !== 1 ? 's' : ''}`;
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  if (secs === 0) return `${mins} minute${mins !== 1 ? 's' : ''}`;
+  return `${mins} minute${mins !== 1 ? 's' : ''} and ${secs} second${secs !== 1 ? 's' : ''}`;
+}
+
+function formatCountdown(ms: number): string {
+  const totalSec = Math.ceil(ms / 1000);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return mins > 0 ? `${mins}m ${secs.toString().padStart(2, '0')}s` : `${secs}s`;
+}
+
+// ─── LocalStorage keys ─────────────────────────────────────────────────────────
+const LS_FAIL_COUNT = 'aj_login_fail_count';
+const LS_BAN_UNTIL  = 'aj_login_ban_until';
+
 // ─── Component ────────────────────────────────────────────────────────────────
 export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
   const [email, setEmail] = useState('');
@@ -80,13 +116,75 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [mode, setMode] = useState<'login' | 'signup' | 'magic-link'>('login');
+  const [mode, setMode] = useState<'login' | 'signup' | 'magic-link' | 'forgot-password'>('login');
+
+  // ── Ban state ──────────────────────────────────────────────────────────────
+  const [failCount, setFailCount] = useState<number>(() => {
+    const stored = localStorage.getItem(LS_FAIL_COUNT);
+    return stored ? parseInt(stored, 10) : 0;
+  });
+  const [banUntil, setBanUntil] = useState<number | null>(() => {
+    const stored = localStorage.getItem(LS_BAN_UNTIL);
+    if (stored) {
+      const ts = parseInt(stored, 10);
+      if (ts > Date.now()) return ts;
+    }
+    return null;
+  });
+  const [countdown, setCountdown] = useState<number>(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Update countdown every second while banned
+  useEffect(() => {
+    if (banUntil && banUntil > Date.now()) {
+      setCountdown(banUntil - Date.now());
+      timerRef.current = setInterval(() => {
+        const remaining = banUntil - Date.now();
+        if (remaining <= 0) {
+          setCountdown(0);
+          setBanUntil(null);
+          setFailCount(0);
+          localStorage.removeItem(LS_BAN_UNTIL);
+          localStorage.removeItem(LS_FAIL_COUNT);
+          clearInterval(timerRef.current!);
+        } else {
+          setCountdown(remaining);
+        }
+      }, 500);
+    }
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [banUntil]);
+
+  const isBanned = banUntil !== null && banUntil > Date.now();
+
+  const recordFailedAttempt = () => {
+    const newCount = failCount + 1;
+    setFailCount(newCount);
+    localStorage.setItem(LS_FAIL_COUNT, String(newCount));
+
+    const banMs = getBanDuration(newCount);
+    if (banMs > 0) {
+      const until = Date.now() + banMs;
+      setBanUntil(until);
+      localStorage.setItem(LS_BAN_UNTIL, String(until));
+    }
+    return newCount;
+  };
+
+  const clearBanState = () => {
+    setFailCount(0);
+    setBanUntil(null);
+    localStorage.removeItem(LS_FAIL_COUNT);
+    localStorage.removeItem(LS_BAN_UNTIL);
+  };
 
   const strength = useMemo(() => getPasswordStrength(password), [password]);
   const passwordsMatch = confirmPassword === '' ? null : password === confirmPassword;
 
   // reset fields when switching modes
-  const switchMode = (next: 'login' | 'signup' | 'magic-link') => {
+  const switchMode = (next: 'login' | 'signup' | 'magic-link' | 'forgot-password') => {
     setMode(next);
     setMessage(null);
     setPassword('');
@@ -118,6 +216,13 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
     setLoading(true);
     setMessage(null);
 
+    // Block if banned
+    if (isBanned) {
+      setMessage({ type: 'error', text: `Too many failed attempts. Try again in ${formatCountdown(countdown)}.` });
+      setLoading(false);
+      return;
+    }
+
     try {
       if (mode === 'magic-link') {
         const { error } = await supabase.auth.signInWithOtp({
@@ -126,6 +231,14 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
         });
         if (error) throw error;
         setMessage({ type: 'success', text: 'Check your email for the magic link!' });
+
+      } else if (mode === 'forgot-password') {
+        const { error } = await supabase.auth.resetPasswordForEmail(email, {
+          redirectTo: `${window.location.origin}?reset_password=true`,
+        });
+        if (error) throw error;
+        setMessage({ type: 'success', text: 'Password reset email sent! Check your inbox.' });
+
       } else if (mode === 'signup') {
         if (password !== confirmPassword) {
           setMessage({ type: 'error', text: 'Passwords do not match.' });
@@ -155,10 +268,33 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
 
         setMessage({ type: 'success', text: 'Account created! Please check your email for verification.' });
         switchMode('login');
+
       } else {
+        // Login mode
         const { error } = await supabase.auth.signInWithPassword({ email, password });
-        if (error) throw error;
-        onClose();
+        if (error) {
+          const newCount = recordFailedAttempt();
+          const banMs = getBanDuration(newCount);
+
+          let errMsg = error.message || 'Authentication failed';
+          if (banMs > 0) {
+            const dur = formatBanDuration(banMs / 1000);
+            errMsg = `Incorrect credentials. Too many failed attempts — you are banned for ${dur}.`;
+          } else {
+            const nextBanRule = BAN_RULES.find(r => newCount < r.attempts);
+            if (nextBanRule) {
+              const remaining = nextBanRule.attempts - newCount;
+              const dur = formatBanDuration(nextBanRule.seconds);
+              errMsg = `Incorrect credentials. ${remaining} more failed attempt${remaining > 1 ? 's' : ''} will result in a ${dur} ban.`;
+            } else {
+              errMsg = `Incorrect credentials (attempt ${newCount}).`;
+            }
+          }
+          setMessage({ type: 'error', text: errMsg });
+        } else {
+          clearBanState();
+          onClose();
+        }
       }
     } catch (error: any) {
       setMessage({ type: 'error', text: error.message || 'Authentication failed' });
@@ -182,6 +318,10 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
     color: '#292524',
   };
 
+  // ── Ban overlay info ───────────────────────────────────────────────────────
+  // Which ban threshold was hit?
+  const activeBanRule = [...BAN_RULES].reverse().find(r => failCount >= r.attempts);
+
   return (
     <AnimatePresence>
       {isOpen && (
@@ -191,7 +331,7 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            onClick={onClose}
+            onClick={!isBanned ? onClose : undefined}
             style={{ position: 'absolute', inset: 0, background: 'rgba(41,37,36,0.45)', backdropFilter: 'blur(6px)' }}
           />
 
@@ -212,6 +352,83 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
               boxShadow: '0 32px 80px rgba(0,0,0,0.18)',
             }}
           >
+            {/* ── BAN OVERLAY ─────────────────────────────────────────────── */}
+            <AnimatePresence>
+              {isBanned && (
+                <motion.div
+                  key="ban-overlay"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    zIndex: 10,
+                    background: 'rgba(255,255,255,0.92)',
+                    backdropFilter: 'blur(4px)',
+                    borderRadius: '28px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '1rem',
+                    padding: '2rem',
+                    textAlign: 'center',
+                  }}
+                >
+                  {/* Animated clock icon */}
+                  <motion.div
+                    animate={{ rotate: [0, -5, 5, -5, 5, 0] }}
+                    transition={{ duration: 0.6, repeat: Infinity, repeatDelay: 2 }}
+                    style={{
+                      width: '64px', height: '64px',
+                      background: 'linear-gradient(135deg,#ef4444,#dc2626)',
+                      borderRadius: '50%',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      boxShadow: '0 8px 24px rgba(239,68,68,0.35)',
+                    }}
+                  >
+                    <Clock style={{ width: '32px', height: '32px', color: '#fff' }} />
+                  </motion.div>
+
+                  <div>
+                    <h3 style={{ fontSize: '1.2rem', fontWeight: 800, color: '#dc2626', marginBottom: '0.25rem' }}>
+                      Account Temporarily Locked
+                    </h3>
+                    <p style={{ fontSize: '0.82rem', color: '#78716c', lineHeight: 1.5 }}>
+                      {activeBanRule
+                        ? `${activeBanRule.attempts} consecutive failed login${activeBanRule.attempts > 1 ? 's' : ''} detected.`
+                        : 'Too many failed login attempts.'}
+                    </p>
+                  </div>
+
+                  {/* Countdown badge */}
+                  <motion.div
+                    key={Math.ceil(countdown / 1000)}
+                    initial={{ scale: 0.9 }}
+                    animate={{ scale: 1 }}
+                    style={{
+                      background: 'linear-gradient(135deg,#fef2f2,#fee2e2)',
+                      border: '2px solid #fca5a5',
+                      borderRadius: '16px',
+                      padding: '0.75rem 1.5rem',
+                    }}
+                  >
+                    <p style={{ fontSize: '0.7rem', fontWeight: 700, color: '#ef4444', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: '4px' }}>
+                      Try again in
+                    </p>
+                    <p style={{ fontSize: '2rem', fontWeight: 900, color: '#dc2626', fontFamily: 'monospace', lineHeight: 1 }}>
+                      {formatCountdown(countdown)}
+                    </p>
+                  </motion.div>
+
+                  <p style={{ fontSize: '0.78rem', color: '#a8a29e' }}>
+                    If you forgot your password, wait for the ban to expire then use "Forgot Password".
+                  </p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
             <div style={{ padding: '2rem' }}>
               {/* Header */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.5rem' }}>
@@ -225,7 +442,10 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                       transition={{ duration: 0.18 }}
                       style={{ fontSize: '1.5rem', fontWeight: 700, color: '#7b6a6c', fontFamily: 'Georgia, serif', marginBottom: '0.25rem' }}
                     >
-                      {mode === 'login' ? 'Welcome Back' : mode === 'signup' ? 'Create Account' : 'Magic Link'}
+                      {mode === 'login' ? 'Welcome Back'
+                        : mode === 'signup' ? 'Create Account'
+                        : mode === 'forgot-password' ? 'Reset Password'
+                        : 'Magic Link'}
                     </motion.h2>
                   </AnimatePresence>
                   <p style={{ fontSize: '0.85rem', color: '#a8a29e' }}>
@@ -233,6 +453,8 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                       ? "Log in to your AJ's Café account"
                       : mode === 'signup'
                       ? 'Join our coffee community'
+                      : mode === 'forgot-password'
+                      ? 'Enter your email to receive a reset link'
                       : 'Sign in without a password'}
                   </p>
                 </div>
@@ -245,6 +467,42 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                   <X style={{ width: '1.25rem', height: '1.25rem' }} />
                 </button>
               </div>
+
+              {/* ── Failed attempts warning bar (before ban) ──────────────── */}
+              <AnimatePresence>
+                {!isBanned && failCount > 0 && (
+                  <motion.div
+                    key="attempts-warning"
+                    initial={{ opacity: 0, height: 0, marginBottom: 0 }}
+                    animate={{ opacity: 1, height: 'auto', marginBottom: '0.75rem' }}
+                    exit={{ opacity: 0, height: 0, marginBottom: 0 }}
+                    style={{ overflow: 'hidden' }}
+                  >
+                    <div style={{
+                      padding: '0.6rem 0.875rem',
+                      borderRadius: '10px',
+                      background: '#fff7ed',
+                      border: '1.5px solid #fed7aa',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                    }}>
+                      <Clock style={{ width: '0.9rem', height: '0.9rem', color: '#f97316', flexShrink: 0 }} />
+                      <span style={{ fontSize: '0.78rem', fontWeight: 600, color: '#9a3412' }}>
+                        {(() => {
+                          const nextRule = BAN_RULES.find(r => failCount < r.attempts);
+                          if (nextRule) {
+                            const rem = nextRule.attempts - failCount;
+                            const dur = formatBanDuration(nextRule.seconds);
+                            return `${failCount} failed attempt${failCount > 1 ? 's' : ''}. ${rem} more will trigger a ${dur} ban.`;
+                          }
+                          return `${failCount} failed attempt${failCount > 1 ? 's' : ''}.`;
+                        })()}
+                      </span>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
 
               {/* Message banner */}
               <AnimatePresence>
@@ -269,33 +527,37 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
               </AnimatePresence>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.875rem' }}>
-                {/* Google */}
-                <button
-                  onClick={handleGoogleLogin}
-                  disabled={loading}
-                  style={{
-                    width: '100%', padding: '0.75rem 1rem',
-                    background: '#fff', border: '1.5px solid #e7e5e4',
-                    borderRadius: '14px', cursor: 'pointer', display: 'flex',
-                    alignItems: 'center', justifyContent: 'center', gap: '0.625rem',
-                    fontWeight: 600, fontSize: '0.9rem', color: '#44403c',
-                    transition: 'border-color 0.2s, box-shadow 0.2s',
-                  }}
-                  onMouseEnter={e => { e.currentTarget.style.borderColor = '#a8a29e'; e.currentTarget.style.boxShadow = '0 2px 8px rgba(0,0,0,0.07)'; }}
-                  onMouseLeave={e => { e.currentTarget.style.borderColor = '#e7e5e4'; e.currentTarget.style.boxShadow = 'none'; }}
-                >
-                  <Chrome style={{ width: '1.1rem', height: '1.1rem', color: '#ea4335' }} />
-                  Continue with Google
-                </button>
+                {/* Google — only show on login / signup */}
+                {(mode === 'login' || mode === 'signup') && (
+                  <button
+                    onClick={handleGoogleLogin}
+                    disabled={loading || isBanned}
+                    style={{
+                      width: '100%', padding: '0.75rem 1rem',
+                      background: '#fff', border: '1.5px solid #e7e5e4',
+                      borderRadius: '14px', cursor: 'pointer', display: 'flex',
+                      alignItems: 'center', justifyContent: 'center', gap: '0.625rem',
+                      fontWeight: 600, fontSize: '0.9rem', color: '#44403c',
+                      transition: 'border-color 0.2s, box-shadow 0.2s',
+                    }}
+                    onMouseEnter={e => { e.currentTarget.style.borderColor = '#a8a29e'; e.currentTarget.style.boxShadow = '0 2px 8px rgba(0,0,0,0.07)'; }}
+                    onMouseLeave={e => { e.currentTarget.style.borderColor = '#e7e5e4'; e.currentTarget.style.boxShadow = 'none'; }}
+                  >
+                    <Chrome style={{ width: '1.1rem', height: '1.1rem', color: '#ea4335' }} />
+                    Continue with Google
+                  </button>
+                )}
 
-                {/* Divider */}
-                <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
-                  <div style={{ flex: 1, height: '1px', background: '#f5f5f4' }} />
-                  <span style={{ padding: '0 0.75rem', fontSize: '0.68rem', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#d6d3d1' }}>
-                    or use email
-                  </span>
-                  <div style={{ flex: 1, height: '1px', background: '#f5f5f4' }} />
-                </div>
+                {/* Divider — only login / signup */}
+                {(mode === 'login' || mode === 'signup') && (
+                  <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+                    <div style={{ flex: 1, height: '1px', background: '#f5f5f4' }} />
+                    <span style={{ padding: '0 0.75rem', fontSize: '0.68rem', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#d6d3d1' }}>
+                      or use email
+                    </span>
+                    <div style={{ flex: 1, height: '1px', background: '#f5f5f4' }} />
+                  </div>
+                )}
 
                 {/* Form */}
                 <form onSubmit={handleEmailAuth} style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
@@ -390,8 +652,8 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                     )}
                   </AnimatePresence>
 
-                  {/* Password */}
-                  {mode !== 'magic-link' && (
+                  {/* Password — hidden in forgot-password & magic-link */}
+                  {mode !== 'magic-link' && mode !== 'forgot-password' && (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                       <InputField icon={Lock} label="Password">
                         <input
@@ -554,27 +816,36 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                   {/* Submit */}
                   <button
                     type="submit"
-                    disabled={loading}
+                    disabled={loading || isBanned}
                     style={{
                       width: '100%', padding: '0.875rem 1rem',
-                      background: 'linear-gradient(135deg,#7b6a6c,#9d7e80)',
+                      background: mode === 'forgot-password'
+                        ? 'linear-gradient(135deg,#3b82f6,#2563eb)'
+                        : 'linear-gradient(135deg,#7b6a6c,#9d7e80)',
                       color: '#fff', border: 'none', borderRadius: '14px',
-                      fontWeight: 700, fontSize: '0.95rem', cursor: loading ? 'not-allowed' : 'pointer',
+                      fontWeight: 700, fontSize: '0.95rem', cursor: (loading || isBanned) ? 'not-allowed' : 'pointer',
                       display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem',
-                      boxShadow: '0 4px 16px rgba(123,106,108,0.28)',
-                      opacity: loading ? 0.65 : 1,
+                      boxShadow: mode === 'forgot-password'
+                        ? '0 4px 16px rgba(59,130,246,0.28)'
+                        : '0 4px 16px rgba(123,106,108,0.28)',
+                      opacity: (loading || isBanned) ? 0.65 : 1,
                       transition: 'opacity 0.2s, transform 0.15s',
                       marginTop: '0.25rem',
                     }}
-                    onMouseEnter={e => { if (!loading) e.currentTarget.style.transform = 'translateY(-1px)'; }}
+                    onMouseEnter={e => { if (!loading && !isBanned) e.currentTarget.style.transform = 'translateY(-1px)'; }}
                     onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; }}
                   >
                     {loading ? (
                       <Loader2 style={{ width: '1.125rem', height: '1.125rem', animation: 'spin 1s linear infinite' }} />
                     ) : (
                       <>
-                        {mode === 'login' ? 'Sign In' : mode === 'signup' ? 'Create Account' : 'Send Magic Link'}
-                        <ArrowRight style={{ width: '1.125rem', height: '1.125rem' }} />
+                        {mode === 'login' ? 'Sign In'
+                          : mode === 'signup' ? 'Create Account'
+                          : mode === 'forgot-password' ? 'Send Reset Link'
+                          : 'Send Magic Link'}
+                        {mode === 'forgot-password'
+                          ? <KeyRound style={{ width: '1.125rem', height: '1.125rem' }} />
+                          : <ArrowRight style={{ width: '1.125rem', height: '1.125rem' }} />}
                       </>
                     )}
                   </button>
@@ -588,9 +859,13 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                         Don't have an account?{' '}
                         <span style={{ fontWeight: 700, color: '#7b6a6c' }}>Sign up</span>
                       </button>
-                      <button onClick={() => switchMode('magic-link')} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '0.85rem', color: '#78716c' }}>
+                      <button onClick={() => switchMode('forgot-password')} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '0.85rem', color: '#78716c' }}>
                         Forgot password?{' '}
-                        <span style={{ fontWeight: 700, color: '#7b6a6c' }}>Use Magic Link</span>
+                        <span style={{ fontWeight: 700, color: '#3b82f6' }}>Reset it here</span>
+                      </button>
+                      <button onClick={() => switchMode('magic-link')} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '0.78rem', color: '#a8a29e' }}>
+                        Or sign in with a{' '}
+                        <span style={{ fontWeight: 700, color: '#a8a29e', textDecoration: 'underline' }}>Magic Link</span>
                       </button>
                     </>
                   ) : (

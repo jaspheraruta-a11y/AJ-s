@@ -314,15 +314,22 @@ async function saveOrder(pending: PendingOrder): Promise<number> {
   const { error: itemsError } = await supabase.from('order_items').insert(orderItemsToInsert);
   if (itemsError) throw itemsError;
 
-  await supabase.from('payments').insert([{
+  // Map 'counter' to 'cash' — the DB enum only allows: cash | card | gcash | paymaya
+  const dbMethod = pending.paymentMethod === 'counter' ? 'cash' : pending.paymentMethod;
+
+  const { error: paymentError } = await supabase.from('payments').insert([{
     order_id: orderData.id,
-    method: pending.paymentMethod,
-    status: 'paid',
+    method: dbMethod,
+    status: pending.paymentMethod === 'counter' ? 'pending' : 'paid',
     amount: pending.total,
-    source_id: pending.sourceId || null,
+    reference_number: pending.sourceId || null,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }]);
+  if (paymentError) {
+    console.error('Payment record insert failed:', paymentError);
+    // Non-fatal — order already created, just log and continue
+  }
 
   // Award loyalty points if user is logged in
   let pointsEarned = 0;

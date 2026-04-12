@@ -43,7 +43,7 @@ export interface Profile {
   full_name?: string;
   avatar_url?: string;
   phone?: string;
-  role: 'client' | 'admin';
+  role: 'client' | 'admin' | 'staff';
   address?: string;
   created_at: string;
   updated_at: string;
@@ -92,7 +92,6 @@ export interface Payment {
 }
 
 export interface Inventory {
-  id: string;
   product_id: string;
   quantity: number;
   low_stock_threshold: number;

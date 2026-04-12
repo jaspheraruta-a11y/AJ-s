@@ -5,7 +5,7 @@ import { supabase } from '../supabase';
 import { Profile } from '../types/database';
 import { StaffPermissionsProvider } from '../contexts/StaffPermissionsContext';
 
-const AdminDashboardWrapper: React.FC = () => {
+const StaffDashboardWrapper: React.FC = () => {
   const navigate = useNavigate();
   const [user, setUser] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
@@ -14,7 +14,7 @@ const AdminDashboardWrapper: React.FC = () => {
     const checkAuth = async () => {
       try {
         const { data: { session } } = await supabase.auth.getSession();
-        
+
         if (!session?.user) {
           navigate('/');
           return;
@@ -28,8 +28,13 @@ const AdminDashboardWrapper: React.FC = () => {
 
         if (error) throw error;
 
-        if (profile.role !== 'admin' && profile.role !== 'staff') {
-          navigate('/');
+        if (profile.role !== 'staff') {
+          // Admins may have also access via /admin route, redirect there
+          if (profile.role === 'admin') {
+            navigate('/admin');
+          } else {
+            navigate('/');
+          }
           return;
         }
 
@@ -59,21 +64,21 @@ const AdminDashboardWrapper: React.FC = () => {
       <div className="min-h-screen bg-stone-50 flex items-center justify-center">
         <div className="flex flex-col items-center gap-4">
           <div className="w-12 h-12 border-4 border-stone-200 border-t-[#7b6a6c] rounded-full animate-spin" />
-          <p className="font-serif italic text-stone-500">Loading admin dashboard...</p>
+          <p className="font-serif italic text-stone-500">Loading staff dashboard...</p>
         </div>
       </div>
     );
   }
 
   if (!user) {
-    return null; // Will redirect automatically
+    return null;
   }
 
   return (
     <StaffPermissionsProvider>
-      <AdminDashboard user={user} onLogout={handleLogout} mode="admin" />
+      <AdminDashboard user={user} onLogout={handleLogout} mode="staff" />
     </StaffPermissionsProvider>
   );
 };
 
-export default AdminDashboardWrapper;
+export default StaffDashboardWrapper;

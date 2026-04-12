@@ -735,6 +735,11 @@ export default function ShopView() {
         return;
       }
 
+      if (profile.role === 'staff') {
+        navigate('/staff');
+        return;
+      }
+
       setUser(profile);
 
       // Read points directly from the profile (updated after every successful payment)

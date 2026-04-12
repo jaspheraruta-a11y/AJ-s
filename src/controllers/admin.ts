@@ -33,10 +33,9 @@ export const useAdminController = () => {
       .from('orders')
       .select('*')
       .order('created_at', { ascending: false });
-    if (!error) {
-      setOrders(data || []);
-      setLastUpdated(new Date());
-    }
+    if (error) { console.error('[Admin] fetchOrders error:', error.message); return; }
+    setOrders(data || []);
+    setLastUpdated(new Date());
   };
 
   const fetchProducts = async () => {
@@ -44,7 +43,8 @@ export const useAdminController = () => {
       .from('products')
       .select('*')
       .order('created_at', { ascending: false });
-    if (!error) setProducts(data || []);
+    if (error) { console.error('[Admin] fetchProducts error:', error.message); return; }
+    setProducts(data || []);
   };
 
   const fetchInventory = async () => {
@@ -52,7 +52,8 @@ export const useAdminController = () => {
       .from('inventory')
       .select('*')
       .order('updated_at', { ascending: false });
-    if (!error) setInventory(data || []);
+    if (error) { console.error('[Admin] fetchInventory error:', error.message); return; }
+    setInventory(data || []);
   };
 
   const fetchUsers = async () => {
@@ -60,7 +61,8 @@ export const useAdminController = () => {
       .from('profiles')
       .select('*')
       .order('created_at', { ascending: false });
-    if (!error) setUsers(data || []);
+    if (error) { console.error('[Admin] fetchUsers error:', error.message); return; }
+    setUsers(data || []);
   };
 
   const fetchPromos = async () => {
@@ -68,7 +70,8 @@ export const useAdminController = () => {
       .from('redeemable_products')
       .select('*')
       .order('created_at', { ascending: false });
-    if (!error) setPromos(data || []);
+    if (error) { console.error('[Admin] fetchPromos error:', error.message); return; }
+    setPromos(data || []);
   };
 
   useEffect(() => {
@@ -126,6 +129,8 @@ export const useAdminController = () => {
   const fetchDashboardData = async () => {
     try {
       setLoading(true);
+
+      // ── Critical fetches: failures here surface as an error state ────────────
       const [
         ordersRes,
         productsRes,
@@ -134,8 +139,6 @@ export const useAdminController = () => {
         paymentsRes,
         inventoryRes,
         promosRes,
-        salesReportsRes,
-        adminLogsRes
       ] = await Promise.all([
         supabase.from('orders').select('*').order('created_at', { ascending: false }),
         supabase.from('products').select('*').order('created_at', { ascending: false }),
@@ -144,8 +147,6 @@ export const useAdminController = () => {
         supabase.from('payments').select('*').order('created_at', { ascending: false }),
         supabase.from('inventory').select('*').order('updated_at', { ascending: false }),
         supabase.from('redeemable_products').select('*').order('created_at', { ascending: false }),
-        supabase.from('sales_reports').select('*').order('report_date', { ascending: false }),
-        supabase.from('admin_logs').select('*').order('created_at', { ascending: false }).limit(50)
       ]);
 
       if (ordersRes.error) throw ordersRes.error;
@@ -155,8 +156,6 @@ export const useAdminController = () => {
       if (paymentsRes.error) throw paymentsRes.error;
       if (inventoryRes.error) throw inventoryRes.error;
       if (promosRes.error) throw promosRes.error;
-      if (salesReportsRes.error) throw salesReportsRes.error;
-      if (adminLogsRes.error) throw adminLogsRes.error;
 
       setOrders(ordersRes.data || []);
       setProducts(productsRes.data || []);
@@ -165,8 +164,7 @@ export const useAdminController = () => {
       setPayments(paymentsRes.data || []);
       setInventory(inventoryRes.data || []);
       setPromos(promosRes.data || []);
-      setSalesReports(salesReportsRes.data || []);
-      setAdminLogs(adminLogsRes.data || []);
+      setLastUpdated(new Date());
     } catch (err: any) {
       if (err?.message?.toLowerCase().includes('jwt')) {
         await supabase.auth.signOut();
@@ -176,6 +174,30 @@ export const useAdminController = () => {
       setError(err.message);
     } finally {
       setLoading(false);
+    }
+
+    // ── Non-critical fetches: failures are logged but do NOT crash the dashboard
+    try {
+      const salesReportsRes = await supabase
+        .from('sales_reports')
+        .select('*')
+        .order('report_date', { ascending: false });
+      if (!salesReportsRes.error) setSalesReports(salesReportsRes.data || []);
+      else console.warn('[Admin] sales_reports fetch failed (non-critical):', salesReportsRes.error.message);
+    } catch (e) {
+      console.warn('[Admin] sales_reports fetch exception (non-critical):', e);
+    }
+
+    try {
+      const adminLogsRes = await supabase
+        .from('admin_logs')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(50);
+      if (!adminLogsRes.error) setAdminLogs(adminLogsRes.data || []);
+      else console.warn('[Admin] admin_logs fetch failed (non-critical):', adminLogsRes.error.message);
+    } catch (e) {
+      console.warn('[Admin] admin_logs fetch exception (non-critical):', e);
     }
   };
 
@@ -256,9 +278,11 @@ export const useAdminController = () => {
 
   const logAdminAction = async (action: string, entityType?: string, entityId?: string, details?: any) => {
     try {
+      const { data: { user } } = await supabase.auth.getUser();
       const { error } = await supabase
         .from('admin_logs')
         .insert([{
+          user_id: user?.id ?? null,
           action,
           entity_type: entityType,
           entity_id: entityId,

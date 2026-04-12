@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   BarChart3, 
@@ -28,8 +28,15 @@ import {
   Target,
   Zap,
   Tag,
-  ImageIcon
+  ImageIcon,
+  Shield,
+  ShieldOff,
+  ShieldCheck,
+  Lock,
+  Timer,
+  Banknote
 } from 'lucide-react';
+import { useStaffPermissions, useStatusChangeCooldown, TabId } from '../contexts/StaffPermissionsContext';
 
 // ── PDF Export Helper ──────────────────────────────────────────────────────────
 const exportOrdersToPDF = (orders: any[], users: any[]) => {
@@ -129,9 +136,11 @@ const InventoryUpdateCell = ({ item, onUpdate }: { item: any, onUpdate: (id: str
 interface AdminDashboardProps {
   user: Profile;
   onLogout: () => void;
+  mode?: 'admin' | 'staff';
 }
 
-const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
+const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 'admin' }) => {
+  const isStaff = mode === 'staff';
   const [activeTab, setActiveTab] = useState('overview');
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
@@ -162,6 +171,30 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
     product_name: '', description: '', points_required: '', stock: '', is_active: true, image_url: ''
   });
   const [addingPromo, setAddingPromo] = useState(false);
+
+  // ── Staff permissions ───────────────────────────────────────────────────────
+  const { isTabRestricted, toggleTabRestriction, restrictedTabs, permissionsLoading } = useStaffPermissions();
+
+  // ── Status cooldown ─────────────────────────────────────────────────────────
+  const { recordStatusChange, getRemainingCooldown, isOnCooldown } = useStatusChangeCooldown();
+  const [cooldownCounters, setCooldownCounters] = useState<Record<string, number>>({});
+
+  // Tick remaining cooldowns every second for UI update
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setCooldownCounters(prev => {
+        const next: Record<string, number> = {};
+        let changed = false;
+        Object.keys(prev).forEach(id => {
+          const rem = getRemainingCooldown(id);
+          if (rem !== prev[id]) changed = true;
+          if (rem > 0) next[id] = rem;
+        });
+        return changed ? next : prev;
+      });
+    }, 500);
+    return () => clearInterval(interval);
+  }, [getRemainingCooldown]);
 
   const { 
     orders, 
@@ -281,10 +314,26 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
 
   const [updatingStatuses, setUpdatingStatuses] = useState<Record<string, boolean>>({});
 
+  // ── Counter Pay Modal state ──────────────────────────────────────────────
+  const [payModal, setPayModal] = useState<{ order: Order } | null>(null);
+  const [amountPaid, setAmountPaid] = useState('');
+  const [processingPay, setProcessingPay] = useState(false);
+
   const handleStatusUpdate = async (orderId: string, newStatus: Order['status']) => {
+    // Staff: enforce 5-second cooldown
+    if (isStaff && isOnCooldown(orderId)) {
+      const rem = getRemainingCooldown(orderId);
+      alert(`⏱️ Please wait ${rem} more second${rem !== 1 ? 's' : ''} before changing this order's status again.`);
+      return;
+    }
     setUpdatingStatuses(prev => ({ ...prev, [orderId]: true }));
     try {
       await updateOrderStatus(orderId, newStatus);
+      // Record the change timestamp so cooldowns are enforced
+      recordStatusChange(orderId);
+      if (isStaff) {
+        setCooldownCounters(prev => ({ ...prev, [orderId]: 5 }));
+      }
       if (selectedOrder && selectedOrder.id === orderId) {
         setSelectedOrder({ ...selectedOrder, status: newStatus });
       }
@@ -292,6 +341,35 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
       alert(`Failed to update status: ${err.message}`);
     } finally {
       setUpdatingStatuses(prev => ({ ...prev, [orderId]: false }));
+    }
+  };
+
+  // ── Counter Pay Handler ─────────────────────────────────────────────────
+  const handleCounterPay = async () => {
+    if (!payModal) return;
+    const paid = parseFloat(amountPaid);
+    if (isNaN(paid) || paid < payModal.order.total) return;
+
+    setProcessingPay(true);
+    try {
+      // 1. Change order status → preparing
+      await updateOrderStatus(payModal.order.id, 'preparing');
+
+      // 2. Mark payment record as paid with the paid_at timestamp
+      // Note: 'counter' is stored as 'cash' in the DB (enum: cash|card|gcash|paymaya)
+      const { supabase } = await import('../supabase');
+      await supabase
+        .from('payments')
+        .update({ status: 'paid', paid_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('order_id', payModal.order.id)
+        .eq('method', 'cash');
+
+      setPayModal(null);
+      setAmountPaid('');
+    } catch (err: any) {
+      alert(`Failed to process payment: ${err.message}`);
+    } finally {
+      setProcessingPay(false);
     }
   };
 
@@ -578,11 +656,24 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
                       >
                         <Eye className="w-4 h-4 text-stone-600" />
                       </button>
+                      {/* Counter Pay button — only for pending orders */}
+                      {order.status === 'pending' && (
+                        <button
+                          onClick={() => { setPayModal({ order }); setAmountPaid(''); }}
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white text-xs font-bold rounded-lg transition-colors shadow-sm shadow-green-200"
+                          title="Collect counter payment"
+                        >
+                          <Banknote className="w-3.5 h-3.5" />
+                          Pay
+                        </button>
+                      )}
                       <select
                         value={order.status}
                         onChange={(e) => handleStatusUpdate(order.id, e.target.value as Order['status'])}
-                        disabled={updatingStatuses[order.id]}
-                        className={`px-2 py-1 text-xs border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#7b6a6c] ${updatingStatuses[order.id] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        disabled={updatingStatuses[order.id] || (isStaff && isOnCooldown(order.id))}
+                        className={`px-2 py-1 text-xs border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#7b6a6c] ${
+                          (updatingStatuses[order.id] || (isStaff && isOnCooldown(order.id))) ? 'opacity-50 cursor-not-allowed' : ''
+                        }`}
                       >
                         <option value="pending">Pending</option>
                         <option value="preparing">Preparing</option>
@@ -590,6 +681,12 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
                         <option value="completed">Completed</option>
                         <option value="cancelled">Cancelled</option>
                       </select>
+                      {isStaff && isOnCooldown(order.id) && (
+                        <span className="flex items-center gap-1 text-xs font-semibold text-orange-600 bg-orange-50 border border-orange-200 px-2 py-1 rounded-lg whitespace-nowrap">
+                          <Timer className="w-3 h-3" />
+                          {getRemainingCooldown(order.id)}s
+                        </span>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -847,7 +944,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
                 const product = products.find(p => p.id === item.product_id);
                 const isLowStock = item.quantity <= item.low_stock_threshold;
                 return (
-                  <tr key={item.id} className="hover:bg-stone-50">
+                  <tr key={item.product_id} className="hover:bg-stone-50">
                     <td className="px-6 py-4">
                       <p className="font-medium text-stone-800">{product?.name || 'Unknown Product'}</p>
                     </td>
@@ -956,6 +1053,96 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
     </div>
   );
 
+  // ── Rollback Permissions Tab (admin-only) ─────────────────────────────────────────
+  const MANAGEABLE_TABS: { id: TabId; label: string; icon: any; description: string }[] = [
+    { id: 'overview',   label: 'Overview',   icon: BarChart3,   description: 'Dashboard overview, stats & quick actions' },
+    { id: 'orders',     label: 'Orders',     icon: ShoppingBag, description: 'View & manage customer orders, update statuses' },
+    { id: 'products',   label: 'Products',   icon: Package,     description: 'Add, edit, and toggle product availability' },
+    { id: 'users',      label: 'Users',      icon: Users,       description: 'View registered users and their roles' },
+    { id: 'inventory',  label: 'Inventory',  icon: Target,      description: 'Track stock levels and update inventory' },
+    { id: 'promos',     label: 'Promos',     icon: Zap,         description: 'Create and manage loyalty point promos' },
+  ];
+
+  const rollbackPermissionsTab = (
+    <div className="space-y-6">
+      {/* Header card */}
+      <div className="bg-gradient-to-r from-[#7b6a6c] to-[#9a8688] rounded-2xl p-6 text-white">
+        <div className="flex items-center gap-4">
+          <div className="w-12 h-12 bg-white/20 rounded-xl flex items-center justify-center">
+            <Shield className="w-6 h-6" />
+          </div>
+          <div>
+            <h2 className="text-xl font-bold">Rollback Permissions</h2>
+            <p className="text-white/80 text-sm mt-0.5">Control which dashboard tabs staff members can access. Restricted tabs will show a blocked message to staff.</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Info banner */}
+      <div className="flex items-start gap-3 bg-amber-50 border border-amber-200 rounded-xl p-4">
+        <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+        <div>
+          <p className="text-sm font-semibold text-amber-800">Time Interval Policy</p>
+          <p className="text-xs text-amber-700 mt-0.5">After any user (admin or staff) changes an order status, staff members must wait <strong>5 seconds</strong> before changing that same order's status again. Admins have no cooldown restriction.</p>
+        </div>
+      </div>
+
+      {/* Permission cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {MANAGEABLE_TABS.map(tab => {
+          const restricted = restrictedTabs.has(tab.id);
+          return (
+            <motion.div
+              key={tab.id}
+              layout
+              className={`bg-white rounded-2xl border-2 p-5 transition-all ${
+                restricted ? 'border-red-200 bg-red-50/40' : 'border-stone-100 hover:border-stone-200'
+              }`}
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className={`w-11 h-11 rounded-xl flex items-center justify-center ${
+                    restricted ? 'bg-red-100 text-red-500' : 'bg-stone-100 text-stone-500'
+                  }`}>
+                    <tab.icon className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <p className={`font-bold ${ restricted ? 'text-red-700' : 'text-stone-800'}`}>{tab.label}</p>
+                    <p className="text-xs text-stone-500 max-w-[200px]">{tab.description}</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => toggleTabRestriction(tab.id)}
+                  className={`flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold transition-all ${
+                    restricted
+                      ? 'bg-red-100 text-red-700 hover:bg-red-200'
+                      : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
+                  }`}
+                >
+                  {restricted ? (
+                    <><ShieldOff className="w-4 h-4" />Restricted</>
+                  ) : (
+                    <><ShieldCheck className="w-4 h-4" />Allow</>
+                  )}
+                </button>
+              </div>
+              {restricted && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  className="mt-3 pt-3 border-t border-red-200 flex items-center gap-2"
+                >
+                  <Lock className="w-3 h-3 text-red-500 shrink-0" />
+                  <p className="text-xs text-red-600 font-medium">Staff will see a "Restricted by Admin" message on this tab</p>
+                </motion.div>
+              )}
+            </motion.div>
+          );
+        })}
+      </div>
+    </div>
+  );
+
   const tabs = [
     { id: 'overview', label: 'Overview', icon: BarChart3 },
     { id: 'orders', label: 'Orders', icon: ShoppingBag },
@@ -963,6 +1150,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
     { id: 'users', label: 'Users', icon: Users },
     { id: 'inventory', label: 'Inventory', icon: Target },
     { id: 'promos', label: 'Promos', icon: Zap },
+    ...(!isStaff ? [{ id: 'permissions', label: 'Rollback Permissions', icon: Shield }] : []),
   ];
 
   if (loading) {
@@ -1005,7 +1193,17 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
             </div>
             <div>
               <div className="flex items-center gap-3">
-                <h1 className="text-xl font-bold text-[#7b6a6c]">Admin Dashboard</h1>
+                <h1 className="text-xl font-bold text-[#7b6a6c]">
+                  {isStaff ? 'Staff Dashboard' : 'Admin Dashboard'}
+                </h1>
+                {/* Role badge */}
+                <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border ${
+                  isStaff
+                    ? 'bg-blue-50 text-blue-700 border-blue-200'
+                    : 'bg-purple-50 text-purple-700 border-purple-200'
+                }`}>
+                  {isStaff ? 'Staff' : 'Admin'}
+                </span>
                 {/* Live indicator */}
                 <span className="flex items-center gap-1.5 px-2.5 py-1 bg-emerald-50 border border-emerald-200 rounded-full">
                   <span className="relative flex h-2 w-2">
@@ -1016,7 +1214,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
                 </span>
               </div>
               <p className="text-sm text-stone-500">
-                Welcome back, {user.full_name || 'Admin'}
+                Welcome back, {user.full_name || (isStaff ? 'Staff' : 'Admin')}
                 {lastUpdated && (
                   <span className="ml-2 text-xs text-stone-400">
                     · Last updated {lastUpdated.toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
@@ -1051,21 +1249,30 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
       {/* Navigation Tabs */}
       <div className="bg-white border-b border-stone-200">
         <div className="px-6">
-          <nav className="flex gap-8">
-            {tabs.map((tab) => (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`flex items-center gap-2 py-4 border-b-2 transition-colors ${
-                  activeTab === tab.id
-                    ? 'border-[#7b6a6c] text-[#7b6a6c]'
-                    : 'border-transparent text-stone-500 hover:text-stone-700'
-                }`}
-              >
-                <tab.icon className="w-4 h-4" />
-                <span className="font-medium">{tab.label}</span>
-              </button>
-            ))}
+          <nav className="flex gap-8 overflow-x-auto">
+            {tabs.map((tab) => {
+              const restricted = isStaff && isTabRestricted(tab.id as TabId);
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`flex items-center gap-2 py-4 border-b-2 transition-colors shrink-0 ${
+                    activeTab === tab.id
+                      ? 'border-[#7b6a6c] text-[#7b6a6c]'
+                      : 'border-transparent text-stone-500 hover:text-stone-700'
+                  }`}
+                >
+                  <tab.icon className="w-4 h-4" />
+                  <span className="font-medium">{tab.label}</span>
+                  {restricted && (
+                    <Lock className="w-3 h-3 text-red-500" />
+                  )}
+                  {tab.id === 'permissions' && (
+                    <span className="ml-1 px-1.5 py-0.5 bg-purple-100 text-purple-700 text-[10px] font-bold rounded-full">Admin</span>
+                  )}
+                </button>
+              );
+            })}
           </nav>
         </div>
       </div>
@@ -1080,15 +1287,175 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout }) => {
             exit={{ opacity: 0, y: -20 }}
             transition={{ duration: 0.2 }}
           >
-            {activeTab === 'overview' && overviewTab}
-            {activeTab === 'orders' && ordersTab}
-            {activeTab === 'products' && productsTab}
-            {activeTab === 'users' && usersTab}
-            {activeTab === 'inventory' && inventoryTab}
-            {activeTab === 'promos' && promosTab}
+            {/* Restriction guard for staff */}
+            {isStaff && permissionsLoading ? (
+              <div className="flex flex-col items-center justify-center min-h-[60vh] text-center gap-4">
+                <div className="w-12 h-12 border-4 border-stone-200 border-t-[#7b6a6c] rounded-full animate-spin" />
+                <p className="text-stone-500 text-sm">Checking permissions...</p>
+              </div>
+            ) : isStaff && isTabRestricted(activeTab as TabId) ? (
+              <div className="flex flex-col items-center justify-center min-h-[60vh] text-center gap-6">
+                <motion.div
+                  initial={{ scale: 0.8, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  className="w-24 h-24 bg-red-50 rounded-3xl flex items-center justify-center border-2 border-red-100"
+                >
+                  <Lock className="w-10 h-10 text-red-400" />
+                </motion.div>
+                <div>
+                  <h2 className="text-2xl font-bold text-stone-800 mb-2">Tab Restricted</h2>
+                  <p className="text-stone-500 max-w-sm">
+                    Access to this tab has been restricted by the admin. Please contact your administrator if you need access.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 px-4 py-2 bg-red-50 border border-red-200 rounded-xl">
+                  <Shield className="w-4 h-4 text-red-500" />
+                  <span className="text-sm font-semibold text-red-700">Restricted by Admin</span>
+                </div>
+              </div>
+            ) : (
+              <>
+                {activeTab === 'overview' && overviewTab}
+                {activeTab === 'orders' && ordersTab}
+                {activeTab === 'products' && productsTab}
+                {activeTab === 'users' && usersTab}
+                {activeTab === 'inventory' && inventoryTab}
+                {activeTab === 'promos' && promosTab}
+                {activeTab === 'permissions' && !isStaff && rollbackPermissionsTab}
+              </>
+            )}
           </motion.div>
         </AnimatePresence>
       </main>
+
+      {/* ── Counter Pay Modal ───────────────────────────────────────────────── */}
+      <AnimatePresence>
+        {payModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-6"
+            onClick={() => { setPayModal(null); setAmountPaid(''); }}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.9, opacity: 0, y: 20 }}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-white rounded-2xl w-full max-w-md overflow-hidden shadow-2xl"
+            >
+              {/* Modal Header */}
+              <div className="p-6 border-b border-stone-100 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-11 h-11 bg-green-50 rounded-xl flex items-center justify-center">
+                    <Banknote className="w-6 h-6 text-green-600" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-bold text-stone-800">Counter Payment</h3>
+                    <p className="text-xs text-stone-500 font-medium">{payModal.order.order_number}</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => { setPayModal(null); setAmountPaid(''); }}
+                  className="p-2 hover:bg-stone-100 rounded-lg transition-colors"
+                >
+                  <X className="w-5 h-5 text-stone-600" />
+                </button>
+              </div>
+
+              <div className="p-6 space-y-5">
+                {/* Order Total */}
+                <div className="bg-stone-50 rounded-xl p-4 flex items-center justify-between border border-stone-100">
+                  <span className="text-sm font-semibold text-stone-500">Order Total</span>
+                  <span className="font-mono text-2xl font-bold text-stone-800">₱{payModal.order.total.toFixed(2)}</span>
+                </div>
+
+                {/* Amount Paid Input */}
+                <div>
+                  <label className="block text-sm font-semibold text-stone-700 mb-2">Amount Paid by Customer</label>
+                  <div className="relative">
+                    <span className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-400 font-bold text-lg select-none">₱</span>
+                    <input
+                      type="number"
+                      min={payModal.order.total}
+                      step="0.01"
+                      value={amountPaid}
+                      onChange={(e) => setAmountPaid(e.target.value)}
+                      placeholder={`Min. ₱${payModal.order.total.toFixed(2)}`}
+                      className="w-full pl-9 pr-4 py-3.5 text-xl font-mono font-bold border-2 border-stone-200 rounded-xl focus:outline-none focus:border-green-500 transition-colors"
+                      autoFocus
+                    />
+                  </div>
+                </div>
+
+                {/* Change Calculation */}
+                <AnimatePresence>
+                  {amountPaid !== '' && !isNaN(parseFloat(amountPaid)) && (
+                    <motion.div
+                      key="change-display"
+                      initial={{ opacity: 0, y: -8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -8 }}
+                      className={`rounded-xl p-4 flex items-center justify-between border ${
+                        parseFloat(amountPaid) >= payModal.order.total
+                          ? 'bg-green-50 border-green-200'
+                          : 'bg-red-50 border-red-200'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        {parseFloat(amountPaid) >= payModal.order.total ? (
+                          <CheckCircle className="w-5 h-5 text-green-600" />
+                        ) : (
+                          <AlertCircle className="w-5 h-5 text-red-500" />
+                        )}
+                        <span className={`text-sm font-bold ${
+                          parseFloat(amountPaid) >= payModal.order.total ? 'text-green-700' : 'text-red-700'
+                        }`}>
+                          {parseFloat(amountPaid) >= payModal.order.total ? 'Change Due' : 'Insufficient Amount'}
+                        </span>
+                      </div>
+                      <span className={`font-mono text-2xl font-bold ${
+                        parseFloat(amountPaid) >= payModal.order.total ? 'text-green-700' : 'text-red-600'
+                      }`}>
+                        {parseFloat(amountPaid) >= payModal.order.total
+                          ? `₱${(parseFloat(amountPaid) - payModal.order.total).toFixed(2)}`
+                          : `-₱${(payModal.order.total - parseFloat(amountPaid)).toFixed(2)}`}
+                      </span>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              {/* Actions */}
+              <div className="px-6 pb-6 flex gap-3">
+                <button
+                  onClick={() => { setPayModal(null); setAmountPaid(''); }}
+                  className="flex-1 py-3 border-2 border-stone-200 text-stone-600 rounded-xl font-semibold hover:bg-stone-50 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleCounterPay}
+                  disabled={
+                    processingPay ||
+                    !amountPaid ||
+                    isNaN(parseFloat(amountPaid)) ||
+                    parseFloat(amountPaid) < payModal.order.total
+                  }
+                  className="flex-1 py-3 bg-green-600 hover:bg-green-700 disabled:bg-stone-300 disabled:cursor-not-allowed text-white rounded-xl font-semibold transition-colors flex items-center justify-center gap-2 shadow-lg shadow-green-200"
+                >
+                  {processingPay ? (
+                    <><RefreshCw className="w-4 h-4 animate-spin" /> Processing…</>
+                  ) : (
+                    <><Banknote className="w-4 h-4" /> Confirm Payment</>
+                  )}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Order Detail Modal */}
       <AnimatePresence>
