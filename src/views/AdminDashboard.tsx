@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   BarChart3, 
@@ -34,7 +34,8 @@ import {
   ShieldCheck,
   Lock,
   Timer,
-  Banknote
+  Banknote,
+  Bell
 } from 'lucide-react';
 import { useStaffPermissions, useStatusChangeCooldown, TabId } from '../contexts/StaffPermissionsContext';
 
@@ -139,6 +140,7 @@ interface AdminDashboardProps {
   mode?: 'admin' | 'staff';
 }
 
+
 const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 'admin' }) => {
   const isStaff = mode === 'staff';
   const [activeTab, setActiveTab] = useState('overview');
@@ -179,6 +181,14 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
   const { recordStatusChange, getRemainingCooldown, isOnCooldown } = useStatusChangeCooldown();
   const [cooldownCounters, setCooldownCounters] = useState<Record<string, number>>({});
 
+  // ── Ready-order notifications ────────────────────────────────────────────────
+  const [readyNotifications, setReadyNotifications] = useState<{ id: string; orderNumber: string; key: number }[]>([]);
+  const prevOrderStatusesRef = useRef<Record<string, string>>({});
+  const notifKeyRef = useRef(0);
+  const dismissNotification = useCallback((key: number) => {
+    setReadyNotifications(prev => prev.filter(n => n.key !== key));
+  }, []);
+
   // Tick remaining cooldowns every second for UI update
   useEffect(() => {
     const interval = setInterval(() => {
@@ -215,6 +225,38 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
   } = useAdminController();
 
   const { orderItems, getOrderItems } = useOrderManagement();
+
+  // Detect orders that just became "ready" and show toast notification
+  useEffect(() => {
+    const prev = prevOrderStatusesRef.current;
+    const newNotifs: { id: string; orderNumber: string; key: number }[] = [];
+
+    orders.forEach(order => {
+      const wasReady = prev[order.id] === 'ready';
+      const isNowReady = order.status === 'ready';
+      if (!wasReady && isNowReady) {
+        notifKeyRef.current += 1;
+        newNotifs.push({ id: order.id, orderNumber: order.order_number, key: notifKeyRef.current });
+      }
+    });
+
+    // Update snapshot
+    const snapshot: Record<string, string> = {};
+    orders.forEach(o => { snapshot[o.id] = o.status; });
+    prevOrderStatusesRef.current = snapshot;
+
+    if (newNotifs.length > 0) {
+      setReadyNotifications(prev => [...prev, ...newNotifs]);
+    }
+  }, [orders]);
+
+  // Auto-dismiss notifications after 8 s
+  useEffect(() => {
+    if (readyNotifications.length === 0) return;
+    const latest = readyNotifications[readyNotifications.length - 1];
+    const timer = setTimeout(() => dismissNotification(latest.key), 8000);
+    return () => clearTimeout(timer);
+  }, [readyNotifications, dismissNotification]);
 
   // ── Add Product handler ─────────────────────────────────────────────────────
   const handleAddProduct = async (e: React.FormEvent) => {
@@ -1184,6 +1226,55 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
 
   return (
     <div className="min-h-screen bg-stone-50">
+
+      {/* ── Ready Order Toast Notifications ──────────────────────────────────── */}
+      <div className="fixed top-5 right-5 z-[9999] flex flex-col gap-3 pointer-events-none">
+        <AnimatePresence>
+          {readyNotifications.map(notif => (
+            <motion.div
+              key={notif.key}
+              initial={{ opacity: 0, x: 80, scale: 0.9 }}
+              animate={{ opacity: 1, x: 0, scale: 1 }}
+              exit={{ opacity: 0, x: 80, scale: 0.9 }}
+              transition={{ type: 'spring', stiffness: 300, damping: 28 }}
+              className="pointer-events-auto flex items-start gap-3 bg-white border-l-4 border-green-500 rounded-2xl shadow-2xl shadow-green-100 p-4 pr-5 w-80 max-w-[calc(100vw-2.5rem)]"
+            >
+              {/* Animated bell icon */}
+              <motion.div
+                animate={{ rotate: [-15, 15, -10, 10, -5, 5, 0] }}
+                transition={{ duration: 0.7, repeat: Infinity, repeatDelay: 2 }}
+                className="w-10 h-10 bg-green-50 border border-green-200 rounded-xl flex items-center justify-center flex-shrink-0 mt-0.5"
+              >
+                <Bell className="w-5 h-5 text-green-600" />
+              </motion.div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-bold text-stone-800">Order Ready! 🎉</p>
+                <p className="text-xs text-stone-500 mt-0.5 truncate">
+                  <span className="font-mono font-semibold text-green-700">{notif.orderNumber}</span>
+                  {' '}is ready for pickup
+                </p>
+                {/* Progress bar */}
+                <motion.div
+                  className="mt-2 h-1 bg-green-100 rounded-full overflow-hidden"
+                >
+                  <motion.div
+                    className="h-full bg-green-500 rounded-full"
+                    initial={{ width: '100%' }}
+                    animate={{ width: '0%' }}
+                    transition={{ duration: 8, ease: 'linear' }}
+                  />
+                </motion.div>
+              </div>
+              <button
+                onClick={() => dismissNotification(notif.key)}
+                className="p-1 hover:bg-stone-100 rounded-lg transition-colors text-stone-400 hover:text-stone-600 flex-shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </motion.div>
+          ))}
+        </AnimatePresence>
+      </div>
       {/* Header */}
       <header className="bg-white border-b border-stone-200 sticky top-0 z-50">
         <div className="px-6 py-4 flex items-center justify-between">

@@ -1,6 +1,6 @@
-import React, { useState, useEffect, Component, ErrorInfo, ReactNode } from 'react';
+import React, { useState, useEffect, useRef, useCallback, Component, ErrorInfo, ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Coffee, ShoppingCart, User, Menu as MenuIcon, X, Plus, Minus, Trash2, ChevronRight, LogOut, UserCircle, AlertCircle, Gift, Star, ClipboardList, Clock, CheckCircle, ChefHat, XCircle, RefreshCw } from 'lucide-react';
+import { Coffee, ShoppingCart, User, Menu as MenuIcon, X, Plus, Minus, Trash2, ChevronRight, LogOut, UserCircle, AlertCircle, Gift, Star, ClipboardList, Clock, CheckCircle, ChefHat, XCircle, RefreshCw, Bell } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useShopController, useCartController, CartItem } from '../controllers';
 import { Category, Product, Profile, ProductSize } from '../types/database';
@@ -597,6 +597,52 @@ const CartDrawer = ({
   </AnimatePresence>
 );
 
+// ── Web Audio alarm (repeating, loud, noticeable) ────────────────────────
+const playOrderReadyChime = () => {
+  try {
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const notes = [523.25, 659.25, 783.99, 1046.5]; // C5 E5 G5 C6
+    const noteDur    = 0.16;
+    const noteGap    = 0.04;
+    const passDur    = notes.length * (noteDur + noteGap); // ~0.8 s per pass
+    const passGap    = 0.22;
+    const totalPasses = 3;
+
+    for (let pass = 0; pass < totalPasses; pass++) {
+      const passOffset = pass * (passDur + passGap);
+      notes.forEach((freq, i) => {
+        const osc  = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'square';          // sharper, more piercing
+        osc.frequency.value = freq;
+        const start = ctx.currentTime + passOffset + i * (noteDur + noteGap);
+        gain.gain.setValueAtTime(0, start);
+        gain.gain.linearRampToValueAtTime(0.7, start + 0.02); // loud
+        gain.gain.setValueAtTime(0.7, start + noteDur - 0.03);
+        gain.gain.linearRampToValueAtTime(0, start + noteDur);
+        osc.start(start);
+        osc.stop(start + noteDur + 0.01);
+      });
+    }
+  } catch (_) {}
+};
+
+// ── Vibration alert for mobile phones ─────────────────────────────────────
+// Pattern: short-pause-short-pause-long  (mirrors the 3-pass audio alarm)
+const vibrateAlert = () => {
+  if ('vibrate' in navigator) {
+    navigator.vibrate([300, 100, 300, 100, 600]);
+  }
+};
+
+const stopVibration = () => {
+  if ('vibrate' in navigator) {
+    navigator.vibrate(0); // cancel any ongoing vibration
+  }
+};
+
 // --- Main View ---
 
 export default function ShopView() {
@@ -626,6 +672,37 @@ export default function ShopView() {
   const [user, setUser] = useState<Profile | null>(null);
   const [clientPoints, setClientPoints] = useState<number>(0);
   const [authLoading, setAuthLoading] = useState(true);
+
+  // --- Ready-order notifications ---
+  const [readyNotifs, setReadyNotifs] = useState<{ id: string; orderNumber: string; key: number }[]>([]);
+  const prevStatuses = useRef<Record<string, string>>({});
+  const notifKey = useRef(0);
+  const alarmIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const dismissClientNotif = useCallback((key: number) => {
+    setReadyNotifs(prev => prev.filter(n => n.key !== key));
+  }, []);
+
+  const stopAlarm = useCallback(() => {
+    if (alarmIntervalRef.current !== null) {
+      clearInterval(alarmIntervalRef.current);
+      alarmIntervalRef.current = null;
+    }
+    stopVibration(); // cancel any ongoing vibration immediately
+  }, []);
+
+  const startAlarm = useCallback(() => {
+    if (alarmIntervalRef.current !== null) return;
+    playOrderReadyChime();
+    vibrateAlert();                              // vibrate on first trigger
+    alarmIntervalRef.current = setInterval(() => {
+      playOrderReadyChime();
+      vibrateAlert();                            // vibrate on each repeat
+    }, 5000);
+  }, []);
+
+  // Stop alarm on unmount
+  useEffect(() => { return () => stopAlarm(); }, [stopAlarm]);
 
   // --- Tab state ---
   const [activeTab, setActiveTab] = useState<'menu' | 'redeem' | 'orders'>('menu');
@@ -696,6 +773,45 @@ export default function ShopView() {
       .subscribe();
     return () => { supabase.removeChannel(channel); };
   }, [user]);
+
+  // Detect new "ready" orders → show toast; keep alarm alive while any order is ready
+  useEffect(() => {
+    const prev = prevStatuses.current;
+    const newNotifs: { id: string; orderNumber: string; key: number }[] = [];
+    let anyReady = false;
+
+    clientOrders.forEach(order => {
+      if (order.status === 'ready') anyReady = true;
+      const wasReady = prev[order.id] === 'ready';
+      if (!wasReady && order.status === 'ready') {
+        notifKey.current += 1;
+        newNotifs.push({ id: order.id, orderNumber: order.order_number, key: notifKey.current });
+      }
+    });
+
+    const snapshot: Record<string, string> = {};
+    clientOrders.forEach(o => { snapshot[o.id] = o.status; });
+    prevStatuses.current = snapshot;
+
+    if (newNotifs.length > 0) {
+      setReadyNotifs(prev => [...prev, ...newNotifs]);
+    }
+
+    // Loop alarm while any order is ready; stop as soon as none are
+    if (anyReady) {
+      startAlarm();
+    } else {
+      stopAlarm();
+    }
+  }, [clientOrders, startAlarm, stopAlarm]);
+
+  // Auto-dismiss client notifications after 8 s
+  useEffect(() => {
+    if (readyNotifs.length === 0) return;
+    const latest = readyNotifs[readyNotifs.length - 1];
+    const t = setTimeout(() => dismissClientNotif(latest.key), 8000);
+    return () => clearTimeout(t);
+  }, [readyNotifs, dismissClientNotif]);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -833,6 +949,51 @@ export default function ShopView() {
 
   return (
     <div className="min-h-screen bg-stone-50 text-[#7b6a6c] selection:bg-[#7b6a6c] selection:text-white">
+
+      {/* ── Client Ready-Order Toast Notifications ─────────────────────────── */}
+      <div className="fixed top-5 right-5 z-[9999] flex flex-col gap-3 pointer-events-none">
+        <AnimatePresence>
+          {readyNotifs.map(notif => (
+            <motion.div
+              key={notif.key}
+              initial={{ opacity: 0, y: -30, scale: 0.92 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -20, scale: 0.92 }}
+              transition={{ type: 'spring', stiffness: 320, damping: 28 }}
+              className="pointer-events-auto flex items-start gap-3 bg-white border-l-4 border-green-500 rounded-2xl shadow-2xl shadow-green-100/60 p-4 pr-5 w-80 max-w-[calc(100vw-2.5rem)]"
+            >
+              <motion.div
+                animate={{ rotate: [-15, 15, -10, 10, -5, 5, 0] }}
+                transition={{ duration: 0.7, repeat: Infinity, repeatDelay: 2.5 }}
+                className="w-10 h-10 bg-green-50 border border-green-200 rounded-xl flex items-center justify-center flex-shrink-0 mt-0.5"
+              >
+                <Bell className="w-5 h-5 text-green-600" />
+              </motion.div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-bold text-stone-800">Your Order is Ready! 🎉</p>
+                <p className="text-xs text-stone-500 mt-0.5">
+                  <span className="font-mono font-semibold text-green-700">{notif.orderNumber}</span>
+                  {' '}— please pick it up!
+                </p>
+                <motion.div className="mt-2 h-1 bg-green-100 rounded-full overflow-hidden">
+                  <motion.div
+                    className="h-full bg-green-500 rounded-full"
+                    initial={{ width: '100%' }}
+                    animate={{ width: '0%' }}
+                    transition={{ duration: 8, ease: 'linear' }}
+                  />
+                </motion.div>
+              </div>
+              <button
+                onClick={() => dismissClientNotif(notif.key)}
+                className="p-1 hover:bg-stone-100 rounded-lg transition-colors text-stone-400 hover:text-stone-600 flex-shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </motion.div>
+          ))}
+        </AnimatePresence>
+      </div>
         <Navbar 
           cartCount={cart.length} 
           onCartClick={() => setIsCartOpen(true)}
