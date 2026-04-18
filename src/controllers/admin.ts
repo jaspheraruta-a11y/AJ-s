@@ -74,6 +74,26 @@ export const useAdminController = () => {
     setPromos(data || []);
   };
 
+  const fetchPayments = async () => {
+    const { data, error } = await supabase
+      .from('payments')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) { console.error('[Admin] fetchPayments error:', error.message); return; }
+    setPayments(data || []);
+    setLastUpdated(new Date());
+  };
+
+  const fetchAdminLogs = async () => {
+    const { data, error } = await supabase
+      .from('admin_logs')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) { console.error('[Admin] fetchAdminLogs error:', error.message); return; }
+    setAdminLogs(data || []);
+  };
+
   useEffect(() => {
     fetchDashboardData();
 
@@ -117,12 +137,30 @@ export const useAdminController = () => {
       })
       .subscribe();
 
+    // ── Real-time: payments ──────────────────────────────────────────────────
+    const paymentsChannel = supabase
+      .channel('admin-payments-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'payments' }, () => {
+        fetchPayments();
+      })
+      .subscribe();
+
+    // ── Real-time: admin_logs ────────────────────────────────────────────────
+    const adminLogsChannel = supabase
+      .channel('admin-logs-realtime')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'admin_logs' }, () => {
+        fetchAdminLogs();
+      })
+      .subscribe();
+
     return () => {
       supabase.removeChannel(ordersChannel);
       supabase.removeChannel(productsChannel);
       supabase.removeChannel(inventoryChannel);
       supabase.removeChannel(usersChannel);
       supabase.removeChannel(promosChannel);
+      supabase.removeChannel(paymentsChannel);
+      supabase.removeChannel(adminLogsChannel);
     };
   }, []);
 

@@ -17,7 +17,7 @@ const SETTINGS_KEY = 'staff_restricted_tabs';
 // ── Context ────────────────────────────────────────────────────────────────────
 const StaffPermissionsContext = createContext<StaffPermissionsContextValue>({
   restrictedTabs: new Set(),
-  toggleTabRestriction: () => {},
+  toggleTabRestriction: () => { },
   isTabRestricted: () => false,
   permissionsLoading: true,
 });
@@ -150,7 +150,7 @@ export const useStatusChangeCooldown = () => {
     cooldownsRef.current = { ...cooldownsRef.current, [orderId]: now };
     try {
       localStorage.setItem(COOLDOWN_STORAGE_KEY, JSON.stringify(cooldownsRef.current));
-    } catch {}
+    } catch { }
   }, []);
 
   /** Returns remaining cooldown seconds for an order (0 if no cooldown active) */
@@ -159,7 +159,7 @@ export const useStatusChangeCooldown = () => {
     try {
       const raw = localStorage.getItem(COOLDOWN_STORAGE_KEY);
       if (raw) cooldownsRef.current = JSON.parse(raw);
-    } catch {}
+    } catch { }
     const lastChange = cooldownsRef.current[orderId];
     if (!lastChange) return 0;
     const elapsed = Date.now() - lastChange;

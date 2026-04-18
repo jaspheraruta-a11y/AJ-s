@@ -35,7 +35,12 @@ import {
   Lock,
   Timer,
   Banknote,
-  Bell
+  Bell,
+  ShoppingCart,
+  UserCircle,
+  Minus,
+  CheckSquare,
+  ClipboardList
 } from 'lucide-react';
 import { useStaffPermissions, useStatusChangeCooldown, TabId } from '../contexts/StaffPermissionsContext';
 
@@ -360,6 +365,164 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
   const [payModal, setPayModal] = useState<{ order: Order } | null>(null);
   const [amountPaid, setAmountPaid] = useState('');
   const [processingPay, setProcessingPay] = useState(false);
+
+  // ── Counter Orders Tab state ─────────────────────────────────────────────
+  type CartItem = { product: Product; quantity: number; size?: string; sizePrice: number };
+  const [counterCart, setCounterCart] = useState<CartItem[]>([]);
+  const [counterCustomerName, setCounterCustomerName] = useState('');
+  const [counterSearchTerm, setCounterSearchTerm] = useState('');
+  const [counterCategoryFilter, setCounterCategoryFilter] = useState('all');
+  const [counterPaymentMethod, setCounterPaymentMethod] = useState<'cash' | 'card' | 'gcash' | 'paymaya'>('cash');
+  const [counterPlacing, setCounterPlacing] = useState(false);
+  const [counterSuccessMsg, setCounterSuccessMsg] = useState<string | null>(null);
+  const [counterProductSizes, setCounterProductSizes] = useState<Record<string, { name: string; price_modifier: number }[]>>({});
+  const [selectedSizes, setSelectedSizes] = useState<Record<string, string>>({});
+  // ── Counter Orders Payment Modal state ───────────────────────────────────
+  const [showCounterPayModal, setShowCounterPayModal] = useState(false);
+  const [counterAmountPaid, setCounterAmountPaid] = useState('');
+
+  // Canonical sizes always shown in counter tab (regardless of DB state)
+  // Medium = base price (0 modifier), Large = +10, Small = 0 (same as Medium)
+  const CANONICAL_SIZES = [
+    { name: 'Medium', price_modifier: 0  },
+    { name: 'Large',  price_modifier: 10 },
+  ];
+
+  // Load product sizes when products are available
+  useEffect(() => {
+    const loadSizes = async () => {
+      const productsWithSizes = products.filter(p => p.has_sizes);
+      if (productsWithSizes.length === 0) return;
+      // For every sized product, always use the canonical Small/Medium/Large set.
+      // This ensures the dropdown always shows all three sizes even if the DB only
+      // stored one size (e.g. only "Large").
+      const sizeMap: Record<string, { name: string; price_modifier: number }[]> = {};
+      productsWithSizes.forEach(p => {
+        sizeMap[p.id] = CANONICAL_SIZES;
+      });
+      setCounterProductSizes(sizeMap);
+    };
+    loadSizes();
+  }, [products]);
+
+  const counterFilteredProducts = products.filter(p => {
+    const matchesCat = counterCategoryFilter === 'all' || p.category_id === counterCategoryFilter;
+    const matchesSearch = counterSearchTerm === '' || p.name.toLowerCase().includes(counterSearchTerm.toLowerCase());
+    return p.is_available && matchesCat && matchesSearch;
+  });
+
+  // Helper: get effective price modifier for a size
+  // Medium = 0 extra (it IS the base price), Large = +10, Small = negative or 0
+  const getSizePrice = (sizes: { name: string; price_modifier: number }[], sizeName: string | undefined): number => {
+    if (!sizeName) return 0;
+    const sizeNameLower = sizeName.toLowerCase();
+    if (sizeNameLower === 'large') return 10;
+    if (sizeNameLower === 'medium') return 0;
+    // Small: use DB modifier (usually 0 or negative)
+    const sizeObj = sizes.find(s => s.name === sizeName);
+    return sizeObj ? sizeObj.price_modifier : 0;
+  };
+
+  // Default size: prefer Medium, fall back to first size
+  const getDefaultSize = (sizes: { name: string; price_modifier: number }[]) => {
+    const medium = sizes.find(s => s.name.toLowerCase() === 'medium');
+    return medium ? medium.name : (sizes[0]?.name || '');
+  };
+
+  const addToCart = (product: Product) => {
+    const sizes = counterProductSizes[product.id] || [];
+    const defaultSize = product.has_sizes && sizes.length > 0 ? getDefaultSize(sizes) : undefined;
+    const sizeName = product.has_sizes && sizes.length > 0 ? (selectedSizes[product.id] || defaultSize) : undefined;
+    const sizePrice = getSizePrice(sizes, sizeName);
+    setCounterCart(prev => {
+      const key = `${product.id}__${sizeName || ''}`;
+      const existing = prev.find(c => `${c.product.id}__${c.size || ''}` === key);
+      if (existing) {
+        return prev.map(c => `${c.product.id}__${c.size || ''}` === key ? { ...c, quantity: c.quantity + 1 } : c);
+      }
+      return [...prev, { product, quantity: 1, size: sizeName, sizePrice }];
+    });
+  };
+
+  const removeFromCart = (index: number) => {
+    setCounterCart(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const adjustCartQty = (index: number, delta: number) => {
+    setCounterCart(prev => prev.map((c, i) => {
+      if (i !== index) return c;
+      const next = c.quantity + delta;
+      return next <= 0 ? { ...c, quantity: 0 } : { ...c, quantity: next };
+    }).filter(c => c.quantity > 0));
+  };
+
+  const counterCartTotal = counterCart.reduce((sum, c) => sum + (c.product.price + c.sizePrice) * c.quantity, 0);
+
+  const handlePlaceCounterOrder = async (paidAmount: number) => {
+    if (counterCart.length === 0) return;
+    setCounterPlacing(true);
+    try {
+      const { supabase: sb } = await import('../supabase');
+
+      // 1. Generate order number
+      const orderNum = `CO-${Date.now().toString().slice(-6)}`;
+
+      // 2. Insert order — status goes directly to 'preparing' since payment is collected upfront
+      const { data: orderData, error: orderErr } = await sb.from('orders').insert({
+        order_number: orderNum,
+        user_id: null,
+        status: 'preparing',
+        order_type: 'walkin',
+        subtotal: counterCartTotal,
+        discount_amount: 0,
+        total: counterCartTotal,
+        customer_notes: counterCustomerName ? `Counter order – ${counterCustomerName}` : 'Counter order',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }).select('id').single();
+
+      if (orderErr) throw orderErr;
+      const orderId = orderData.id;
+
+      // 3. Insert order items
+      const itemRows = counterCart.map(c => ({
+        order_id: orderId,
+        product_id: c.product.id,
+        product_name: c.product.name + (c.size ? ` (${c.size})` : ''),
+        size: c.size || null,
+        quantity: c.quantity,
+        unit_price: c.product.price + c.sizePrice,
+        line_total: (c.product.price + c.sizePrice) * c.quantity,
+      }));
+      const { error: itemErr } = await sb.from('order_items').insert(itemRows);
+      if (itemErr) throw itemErr;
+
+      // 4. Insert payment record — marked as paid immediately (staff collected at counter)
+      const { error: payErr } = await sb.from('payments').insert({
+        order_id: orderId,
+        method: counterPaymentMethod,
+        status: 'paid',
+        amount: paidAmount,
+        paid_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+      if (payErr) throw payErr;
+
+      // 5. Reset form & close modal
+      setShowCounterPayModal(false);
+      setCounterAmountPaid('');
+      setCounterCart([]);
+      setCounterCustomerName('');
+      setCounterSuccessMsg(`✅ Order ${orderNum} placed & paid — change: ₱${(paidAmount - counterCartTotal).toFixed(2)}`);
+      setTimeout(() => setCounterSuccessMsg(null), 6000);
+      refreshData();
+    } catch (err: any) {
+      alert(`Failed to place counter order: ${err.message}`);
+    } finally {
+      setCounterPlacing(false);
+    }
+  };
 
   const handleStatusUpdate = async (orderId: string, newStatus: Order['status']) => {
     // Staff: enforce 5-second cooldown
@@ -1095,6 +1258,246 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     </div>
   );
 
+  // ── Counter Orders Tab ───────────────────────────────────────────────────────
+  const counterOrdersTab = (
+    <div className="space-y-6">
+      {/* Success message */}
+      {counterSuccessMsg && (
+        <motion.div
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0 }}
+          className="flex items-center gap-3 bg-green-50 border border-green-200 text-green-800 rounded-2xl px-5 py-4 font-semibold text-sm"
+        >
+          <CheckSquare className="w-5 h-5 text-green-600 shrink-0" />
+          {counterSuccessMsg}
+        </motion.div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* ── LEFT: Product browser ──────────────────────────── */}
+        <div className="lg:col-span-2 space-y-4">
+          {/* Header */}
+          <div className="bg-gradient-to-r from-[#7b6a6c] to-[#9a8688] rounded-2xl p-5 text-white flex items-center gap-4">
+            <div className="w-12 h-12 bg-white/20 rounded-xl flex items-center justify-center">
+              <ClipboardList className="w-6 h-6" />
+            </div>
+            <div>
+              <h2 className="text-lg font-bold">Counter Orders</h2>
+              <p className="text-white/80 text-sm">Order on behalf of walk-in or phone customers</p>
+            </div>
+          </div>
+
+          {/* Filters */}
+          <div className="bg-white rounded-2xl border border-stone-100 p-4">
+            <div className="flex flex-col sm:flex-row gap-3">
+              <div className="flex-1 relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-stone-400" />
+                <input
+                  type="text"
+                  placeholder="Search products…"
+                  value={counterSearchTerm}
+                  onChange={e => setCounterSearchTerm(e.target.value)}
+                  className="w-full pl-9 pr-4 py-2.5 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c] text-sm"
+                />
+              </div>
+              <select
+                value={counterCategoryFilter}
+                onChange={e => setCounterCategoryFilter(e.target.value)}
+                className="px-4 py-2.5 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c] text-sm"
+              >
+                <option value="all">All Categories</option>
+                {categories.map(c => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Product Grid */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            {counterFilteredProducts.map(product => {
+              const sizes = counterProductSizes[product.id] || [];
+              const hasSizes = product.has_sizes && sizes.length > 0;
+              const defaultSize = hasSizes ? getDefaultSize(sizes) : '';
+              const selectedSize = selectedSizes[product.id] || defaultSize;
+              const unitPrice = product.price + getSizePrice(sizes, selectedSize || undefined);
+              const inventoryItem = inventory.find(i => i.product_id === product.id);
+              const inStock = !inventoryItem || inventoryItem.quantity > 0;
+
+              return (
+                <div
+                  key={product.id}
+                  className={`bg-white rounded-2xl border border-stone-100 overflow-hidden flex flex-col hover:shadow-md transition-shadow ${
+                    !inStock ? 'opacity-50' : ''
+                  }`}
+                >
+                  <div className="relative h-28 bg-stone-100 overflow-hidden">
+                    <img
+                      src={product.image_url || `https://picsum.photos/seed/${product.slug}/200/120`}
+                      alt={product.name}
+                      className="w-full h-full object-cover"
+                    />
+                    {!inStock && (
+                      <div className="absolute inset-0 bg-stone-900/50 flex items-center justify-center">
+                        <span className="text-white text-xs font-bold">Out of Stock</span>
+                      </div>
+                    )}
+                  </div>
+                  <div className="p-3 flex flex-col gap-2 flex-1">
+                    <p className="text-sm font-bold text-stone-800 leading-tight">{product.name}</p>
+                    <p className="text-xs font-semibold text-[#7b6a6c]">₱{unitPrice.toFixed(2)}</p>
+                    {hasSizes && (
+                      <select
+                        value={selectedSize}
+                        onChange={e => setSelectedSizes(prev => ({ ...prev, [product.id]: e.target.value }))}
+                        className="text-xs px-2 py-1 border border-stone-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-[#7b6a6c]"
+                        onClick={e => e.stopPropagation()}
+                      >
+                        {sizes.map(s => {
+                          const sizeLabel = s.name.toLowerCase() === 'medium'
+                            ? `${s.name} (base)`
+                            : s.name.toLowerCase() === 'large'
+                              ? `${s.name} (+₱10)`
+                              : s.name;
+                          return (
+                            <option key={s.name} value={s.name}>{sizeLabel}</option>
+                          );
+                        })}
+                      </select>
+                    )}
+                    <button
+                      disabled={!inStock}
+                      onClick={() => addToCart(product)}
+                      className="mt-auto flex items-center justify-center gap-1.5 py-2 bg-[#7b6a6c] hover:bg-[#6a5a5c] disabled:bg-stone-300 text-white text-xs font-bold rounded-xl transition-colors"
+                    >
+                      <Plus className="w-3.5 h-3.5" /> Add to Order
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+            {counterFilteredProducts.length === 0 && (
+              <div className="col-span-3 flex flex-col items-center justify-center py-16 text-stone-400 gap-3">
+                <Coffee className="w-10 h-10 opacity-30" />
+                <p className="text-sm">No available products found</p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ── RIGHT: Cart & checkout ────────────────────────── */}
+        <div className="space-y-4">
+          {/* Customer info */}
+          <div className="bg-white rounded-2xl border border-stone-100 p-5">
+            <div className="flex items-center gap-2 mb-3">
+              <UserCircle className="w-5 h-5 text-stone-400" />
+              <p className="font-bold text-stone-700 text-sm">Customer (optional)</p>
+            </div>
+            <input
+              type="text"
+              placeholder="Name or phone number…"
+              value={counterCustomerName}
+              onChange={e => setCounterCustomerName(e.target.value)}
+              className="w-full px-3 py-2.5 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c] text-sm"
+            />
+          </div>
+
+          {/* Cart */}
+          <div className="bg-white rounded-2xl border border-stone-100 overflow-hidden">
+            <div className="p-4 border-b border-stone-100 flex items-center gap-2">
+              <ShoppingCart className="w-5 h-5 text-[#7b6a6c]" />
+              <p className="font-bold text-stone-800">Order ({counterCart.length} items)</p>
+            </div>
+
+            {counterCart.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-10 text-stone-300 gap-3">
+                <ShoppingCart className="w-10 h-10" />
+                <p className="text-sm">Cart is empty — add items</p>
+              </div>
+            ) : (
+              <div className="divide-y divide-stone-100">
+                {counterCart.map((item, idx) => (
+                  <div key={idx} className="flex items-center gap-3 px-4 py-3">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-semibold text-stone-800 truncate">{item.product.name}</p>
+                      {item.size && <p className="text-xs text-stone-400">{item.size}</p>}
+                      <p className="text-xs font-bold text-[#7b6a6c]">₱{((item.product.price + item.sizePrice) * item.quantity).toFixed(2)}</p>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        onClick={() => adjustCartQty(idx, -1)}
+                        className="w-7 h-7 rounded-lg bg-stone-100 hover:bg-stone-200 flex items-center justify-center transition-colors"
+                      >
+                        <Minus className="w-3 h-3 text-stone-600" />
+                      </button>
+                      <span className="w-6 text-center text-sm font-bold text-stone-800">{item.quantity}</span>
+                      <button
+                        onClick={() => adjustCartQty(idx, 1)}
+                        className="w-7 h-7 rounded-lg bg-stone-100 hover:bg-stone-200 flex items-center justify-center transition-colors"
+                      >
+                        <Plus className="w-3 h-3 text-stone-600" />
+                      </button>
+                      <button
+                        onClick={() => removeFromCart(idx)}
+                        className="w-7 h-7 rounded-lg hover:bg-red-50 flex items-center justify-center transition-colors ml-1"
+                      >
+                        <X className="w-3.5 h-3.5 text-red-400" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Payment method */}
+          <div className="bg-white rounded-2xl border border-stone-100 p-5">
+            <p className="font-bold text-stone-700 text-sm mb-3">Payment Method</p>
+            <div className="grid grid-cols-2 gap-2">
+              {(['cash', 'card', 'gcash', 'paymaya'] as const).map(m => (
+                <button
+                  key={m}
+                  onClick={() => setCounterPaymentMethod(m)}
+                  className={`py-2 text-sm font-semibold rounded-xl border-2 capitalize transition-all ${
+                    counterPaymentMethod === m
+                      ? 'border-[#7b6a6c] bg-[#f5f0ef] text-[#7b6a6c]'
+                      : 'border-stone-200 text-stone-500 hover:border-stone-300'
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Total + Place Order */}
+          <div className="bg-white rounded-2xl border border-stone-100 p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-stone-500 font-semibold">Total</span>
+              <span className="font-mono text-2xl font-bold text-stone-800">₱{counterCartTotal.toFixed(2)}</span>
+            </div>
+            <button
+              onClick={() => { setCounterAmountPaid(''); setShowCounterPayModal(true); }}
+              disabled={counterCart.length === 0 || counterPlacing}
+              className="w-full py-3.5 bg-[#7b6a6c] hover:bg-[#6a5a5c] disabled:bg-stone-300 disabled:cursor-not-allowed text-white font-bold rounded-xl transition-colors flex items-center justify-center gap-2 shadow-lg shadow-stone-200"
+            >
+              <Banknote className="w-4 h-4" /> Proceed to Payment
+            </button>
+            {counterCart.length > 0 && (
+              <button
+                onClick={() => setCounterCart([])}
+                className="w-full py-2 text-sm text-stone-400 hover:text-red-500 transition-colors"
+              >
+                Clear cart
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
   // ── Rollback Permissions Tab (admin-only) ─────────────────────────────────────────
   const MANAGEABLE_TABS: { id: TabId; label: string; icon: any; description: string }[] = [
     { id: 'overview',   label: 'Overview',   icon: BarChart3,   description: 'Dashboard overview, stats & quick actions' },
@@ -1188,6 +1591,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
   const tabs = [
     { id: 'overview', label: 'Overview', icon: BarChart3 },
     { id: 'orders', label: 'Orders', icon: ShoppingBag },
+    { id: 'counter', label: 'Counter Orders', icon: ClipboardList },
     { id: 'products', label: 'Products', icon: Package },
     { id: 'users', label: 'Users', icon: Users },
     { id: 'inventory', label: 'Inventory', icon: Target },
@@ -1408,6 +1812,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
               <>
                 {activeTab === 'overview' && overviewTab}
                 {activeTab === 'orders' && ordersTab}
+                {activeTab === 'counter' && counterOrdersTab}
                 {activeTab === 'products' && productsTab}
                 {activeTab === 'users' && usersTab}
                 {activeTab === 'inventory' && inventoryTab}
@@ -1418,6 +1823,186 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
           </motion.div>
         </AnimatePresence>
       </main>
+
+      {/* ── Counter Orders Payment Modal (from Counter Orders tab) ───────── */}
+      <AnimatePresence>
+        {showCounterPayModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-6"
+            onClick={() => { setShowCounterPayModal(false); setCounterAmountPaid(''); }}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.9, opacity: 0, y: 20 }}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-white rounded-2xl w-full max-w-md overflow-hidden shadow-2xl"
+            >
+              {/* Modal Header */}
+              <div className="bg-gradient-to-r from-[#7b6a6c] to-[#9a8688] p-6 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 bg-white/20 rounded-xl flex items-center justify-center">
+                    <Banknote className="w-6 h-6 text-white" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-bold text-white">Counter Payment</h3>
+                    <p className="text-white/70 text-xs mt-0.5">Collect payment before placing order</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => { setShowCounterPayModal(false); setCounterAmountPaid(''); }}
+                  className="p-2 hover:bg-white/20 rounded-lg transition-colors"
+                >
+                  <X className="w-5 h-5 text-white" />
+                </button>
+              </div>
+
+              <div className="p-6 space-y-5">
+                {/* Order summary */}
+                <div className="bg-stone-50 rounded-xl border border-stone-100 divide-y divide-stone-100 overflow-hidden">
+                  {counterCart.map((item, idx) => (
+                    <div key={idx} className="flex items-center justify-between px-4 py-2.5">
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-stone-800 truncate">{item.product.name}</p>
+                        {item.size && <p className="text-xs text-stone-400">{item.size} × {item.quantity}</p>}
+                        {!item.size && <p className="text-xs text-stone-400">× {item.quantity}</p>}
+                      </div>
+                      <span className="font-mono text-sm font-bold text-stone-700 shrink-0 ml-3">
+                        ₱{((item.product.price + item.sizePrice) * item.quantity).toFixed(2)}
+                      </span>
+                    </div>
+                  ))}
+                  <div className="flex items-center justify-between px-4 py-3 bg-stone-100">
+                    <span className="text-sm font-bold text-stone-600">Order Total</span>
+                    <span className="font-mono text-xl font-bold text-stone-800">₱{counterCartTotal.toFixed(2)}</span>
+                  </div>
+                </div>
+
+                {/* Payment method */}
+                <div>
+                  <p className="text-sm font-semibold text-stone-700 mb-2">Payment Method</p>
+                  <div className="grid grid-cols-4 gap-2">
+                    {(['cash', 'card', 'gcash', 'paymaya'] as const).map(m => (
+                      <button
+                        key={m}
+                        onClick={() => setCounterPaymentMethod(m)}
+                        className={`py-2 text-xs font-bold rounded-xl border-2 capitalize transition-all ${
+                          counterPaymentMethod === m
+                            ? 'border-[#7b6a6c] bg-[#f5f0ef] text-[#7b6a6c]'
+                            : 'border-stone-200 text-stone-500 hover:border-stone-300'
+                        }`}
+                      >
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Amount paid (only relevant for cash) */}
+                <div>
+                  <label className="block text-sm font-semibold text-stone-700 mb-2">
+                    {counterPaymentMethod === 'cash' ? 'Amount Given by Customer' : 'Amount Charged'}
+                  </label>
+                  <div className="relative">
+                    <span className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-400 font-bold text-lg select-none">₱</span>
+                    <input
+                      type="number"
+                      min={counterCartTotal}
+                      step="0.01"
+                      value={counterAmountPaid}
+                      onChange={(e) => setCounterAmountPaid(e.target.value)}
+                      placeholder={`Min. ₱${counterCartTotal.toFixed(2)}`}
+                      className="w-full pl-9 pr-4 py-3.5 text-xl font-mono font-bold border-2 border-stone-200 rounded-xl focus:outline-none focus:border-[#7b6a6c] transition-colors"
+                      autoFocus
+                    />
+                  </div>
+                </div>
+
+                {/* Change display */}
+                <AnimatePresence>
+                  {counterAmountPaid !== '' && !isNaN(parseFloat(counterAmountPaid)) && (
+                    <motion.div
+                      key="counter-change"
+                      initial={{ opacity: 0, y: -8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -8 }}
+                      className={`rounded-xl p-4 flex items-center justify-between border ${
+                        parseFloat(counterAmountPaid) >= counterCartTotal
+                          ? 'bg-emerald-50 border-emerald-200'
+                          : 'bg-red-50 border-red-200'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        {parseFloat(counterAmountPaid) >= counterCartTotal ? (
+                          <CheckCircle className="w-5 h-5 text-emerald-600" />
+                        ) : (
+                          <AlertCircle className="w-5 h-5 text-red-500" />
+                        )}
+                        <span className={`text-sm font-bold ${
+                          parseFloat(counterAmountPaid) >= counterCartTotal ? 'text-emerald-700' : 'text-red-700'
+                        }`}>
+                          {parseFloat(counterAmountPaid) >= counterCartTotal ? 'Change Due' : 'Insufficient Amount'}
+                        </span>
+                      </div>
+                      <span className={`font-mono text-2xl font-bold ${
+                        parseFloat(counterAmountPaid) >= counterCartTotal ? 'text-emerald-700' : 'text-red-600'
+                      }`}>
+                        {parseFloat(counterAmountPaid) >= counterCartTotal
+                          ? `₱${(parseFloat(counterAmountPaid) - counterCartTotal).toFixed(2)}`
+                          : `-₱${(counterCartTotal - parseFloat(counterAmountPaid)).toFixed(2)}`}
+                      </span>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
+                {/* Quick cash shortcuts (cash only) */}
+                {counterPaymentMethod === 'cash' && (
+                  <div className="flex flex-wrap gap-2">
+                    {[counterCartTotal, Math.ceil(counterCartTotal / 50) * 50, Math.ceil(counterCartTotal / 100) * 100, Math.ceil(counterCartTotal / 500) * 500].filter((v, i, a) => a.indexOf(v) === i).map(amount => (
+                      <button
+                        key={amount}
+                        onClick={() => setCounterAmountPaid(amount.toFixed(2))}
+                        className="px-3 py-1.5 text-xs font-bold rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-700 transition-colors border border-stone-200"
+                      >
+                        ₱{amount.toFixed(0)}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Actions */}
+              <div className="px-6 pb-6 flex gap-3">
+                <button
+                  onClick={() => { setShowCounterPayModal(false); setCounterAmountPaid(''); }}
+                  className="flex-1 py-3 border-2 border-stone-200 text-stone-600 rounded-xl font-semibold hover:bg-stone-50 transition-colors"
+                >
+                  Back
+                </button>
+                <button
+                  onClick={() => handlePlaceCounterOrder(parseFloat(counterAmountPaid))}
+                  disabled={
+                    counterPlacing ||
+                    !counterAmountPaid ||
+                    isNaN(parseFloat(counterAmountPaid)) ||
+                    parseFloat(counterAmountPaid) < counterCartTotal
+                  }
+                  className="flex-1 py-3 bg-[#7b6a6c] hover:bg-[#6a5a5c] disabled:bg-stone-300 disabled:cursor-not-allowed text-white rounded-xl font-semibold transition-colors flex items-center justify-center gap-2 shadow-lg shadow-stone-200"
+                >
+                  {counterPlacing ? (
+                    <><RefreshCw className="w-4 h-4 animate-spin" /> Placing…</>
+                  ) : (
+                    <><CheckSquare className="w-4 h-4" /> Confirm & Place Order</>
+                  )}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* ── Counter Pay Modal ───────────────────────────────────────────────── */}
       <AnimatePresence>

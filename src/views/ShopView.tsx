@@ -8,6 +8,7 @@ import Logo from '../components/Logo';
 import { supabase } from '../supabase';
 import LoginModal from '../components/LoginModal';
 import ProductModal from '../components/ProductModal';
+import UserAgreementModal, { useAgreementModal } from '../components/UserAgreementModal';
 
 // --- Types ---
 interface RedeemableProduct {
@@ -673,6 +674,9 @@ export default function ShopView() {
   const [clientPoints, setClientPoints] = useState<number>(0);
   const [authLoading, setAuthLoading] = useState(true);
 
+  // --- User Agreement Modal ---
+  const { showAgreement, handleAccept } = useAgreementModal();
+
   // --- Ready-order notifications ---
   const [readyNotifs, setReadyNotifs] = useState<{ id: string; orderNumber: string; key: number }[]>([]);
   const prevStatuses = useRef<Record<string, string>>({});
@@ -768,6 +772,25 @@ export default function ShopView() {
         { event: '*', schema: 'public', table: 'orders', filter: `user_id=eq.${user.id}` },
         (_payload) => {
           fetchClientOrders(user.id);
+        }
+      )
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [user]);
+
+  // Real-time profile updates (keep loyalty points in sync after purchases)
+  useEffect(() => {
+    if (!user) return;
+    const channel = supabase
+      .channel('client-profile-realtime')
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'profiles', filter: `id=eq.${user.id}` },
+        (payload) => {
+          const updated = payload.new as any;
+          if (typeof updated?.points === 'number') {
+            setClientPoints(updated.points);
+          }
         }
       )
       .subscribe();
@@ -949,6 +972,9 @@ export default function ShopView() {
 
   return (
     <div className="min-h-screen bg-stone-50 text-[#7b6a6c] selection:bg-[#7b6a6c] selection:text-white">
+
+      {/* ── User Agreement Modal ────────────────────────────────────────────── */}
+      <UserAgreementModal isOpen={showAgreement} onAccept={handleAccept} />
 
       {/* ── Client Ready-Order Toast Notifications ─────────────────────────── */}
       <div className="fixed top-5 right-5 z-[9999] flex flex-col gap-3 pointer-events-none">

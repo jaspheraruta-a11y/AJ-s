@@ -10,6 +10,24 @@ export const useShopController = () => {
   const [error, setError] = useState<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
 
+  const fetchProducts = async () => {
+    try {
+      const prods = await ProductModel.getAll();
+      setProducts(prods);
+    } catch (err: any) {
+      console.error('[Shop] fetchProducts error:', err.message);
+    }
+  };
+
+  const fetchCategories = async () => {
+    try {
+      const cats = await CategoryModel.getAll();
+      setCategories(cats);
+    } catch (err: any) {
+      console.error('[Shop] fetchCategories error:', err.message);
+    }
+  };
+
   useEffect(() => {
     const fetchData = async () => {
       try {
@@ -33,6 +51,27 @@ export const useShopController = () => {
     };
 
     fetchData();
+
+    // ── Real-time: products (availability, price, new items) ─────────────────
+    const productsChannel = supabase
+      .channel('shop-products-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, () => {
+        fetchProducts();
+      })
+      .subscribe();
+
+    // ── Real-time: categories (new categories, sort order changes) ───────────
+    const categoriesChannel = supabase
+      .channel('shop-categories-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'categories' }, () => {
+        fetchCategories();
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(productsChannel);
+      supabase.removeChannel(categoriesChannel);
+    };
   }, []);
 
   const filteredProducts = selectedCategory
