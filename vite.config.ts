@@ -10,7 +10,6 @@ export default defineConfig(({mode}) => {
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
       'process.env.PAYMONGO_SECRET_KEY': JSON.stringify(env.PAYMONGO_SECRET_KEY),
-      'process.env.STRIPE_SECRET_KEY': JSON.stringify(env.STRIPE_SECRET_KEY),
     },
     resolve: {
       alias: {
@@ -25,26 +24,20 @@ export default defineConfig(({mode}) => {
         '/api/paymongo': {
           target: 'https://api.paymongo.com',
           changeOrigin: true,
-          rewrite: (path) => path.replace(/^\/api\/paymongo/, ''),
-          configure: (proxy, options) => {
+          rewrite: (path) => {
+            const q = path.indexOf('?');
+            if (q === -1) return '/v1';
+            const target = new URLSearchParams(path.slice(q + 1)).get('target');
+            return target ? `/v1/${target}` : '/v1';
+          },
+          configure: (proxy) => {
             proxy.on('proxyReq', (proxyReq, req) => {
               const secretKey = env.PAYMONGO_SECRET_KEY;
               const encoded = Buffer.from(`${secretKey}:`).toString('base64');
               proxyReq.setHeader('Authorization', `Basic ${encoded}`);
-              proxyReq.setHeader('Content-Type', 'application/json');
-            });
-          },
-        },
-        // Stripe proxy – injects Bearer auth so the secret key stays server-side
-        '/api/stripe': {
-          target: 'https://api.stripe.com',
-          changeOrigin: true,
-          rewrite: (path) => path.replace(/^\/api\/stripe/, ''),
-          configure: (proxy) => {
-            proxy.on('proxyReq', (proxyReq) => {
-              const secretKey = env.STRIPE_SECRET_KEY;
-              proxyReq.setHeader('Authorization', `Bearer ${secretKey}`);
-              proxyReq.setHeader('Content-Type', 'application/x-www-form-urlencoded');
+              if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+                proxyReq.setHeader('Content-Type', 'application/json');
+              }
             });
           },
         },

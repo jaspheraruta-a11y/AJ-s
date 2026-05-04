@@ -14,16 +14,15 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { supabase } from '../supabase';
-import { createGCashSource } from '../services/paymongo';
-import { getStripe, createStripePaymentIntent } from '../services/stripe';
 import {
-  Elements,
-  CardNumberElement,
-  CardExpiryElement,
-  CardCvcElement,
-  useElements,
-  useStripe,
-} from '@stripe/react-stripe-js';
+  createGCashSource,
+  createCardPaymentIntent,
+  createCardPaymentMethod,
+  attachPaymentMethodToIntent,
+  retrievePaymentIntent,
+  retrievePaymentIntentWhenReady,
+  PAYMONGO_MIN_CARD_PESOS,
+} from '../services/paymongo';
 
 type PaymentMethod = 'gcash' | 'card' | 'counter' | null;
 
@@ -57,20 +56,8 @@ function clearPendingOrder() {
 
 const CART_STATE_KEY = 'payment_cart_state';
 
-// ── Stripe Element style ───────────────────────────────────────────────────
-const stripeElementStyle = {
-  base: {
-    fontSize: '15px',
-    color: '#44403c',
-    fontFamily: '"Inter", sans-serif',
-    fontSmoothing: 'antialiased',
-    '::placeholder': { color: '#a8a29e' },
-  },
-  invalid: { color: '#ef4444', iconColor: '#ef4444' },
-};
-
-// ── Card Form (inner – must live inside <Elements>) ────────────────────────
-function StripeCardForm({
+// ── PayMongo card form (Payment Intents + Payment Methods; 3DS = full-page bank redirect) ──
+function PayMongoCardForm({
   total,
   cart,
   userId,
@@ -83,40 +70,81 @@ function StripeCardForm({
   onSuccess: (pts: number) => void;
   onError: (msg: string) => void;
 }) {
-  const stripe = useStripe();
-  const elements = useElements();
   const [processing, setProcessing] = useState(false);
   const [cardName, setCardName] = useState('');
+  const [cardNumber, setCardNumber] = useState('');
+  const [expMonth, setExpMonth] = useState('');
+  const [expYear, setExpYear] = useState('');
+  const [cvc, setCvc] = useState('');
   const [focusedField, setFocusedField] = useState<string | null>(null);
 
+  const formatCardDisplay = (raw: string) => {
+    const d = raw.replace(/\D/g, '').slice(0, 19);
+    return d.replace(/(\d{4})(?=\d)/g, '$1 ').trim();
+  };
+
   const handlePay = async () => {
-    if (!stripe || !elements) return;
     setProcessing(true);
-
     try {
-      // 1. Create PaymentIntent on the server (via Vite proxy)
-      const { clientSecret } = await createStripePaymentIntent(total);
+      if (total + 1e-9 < PAYMONGO_MIN_CARD_PESOS) {
+        throw new Error(`PayMongo requires at least ₱${PAYMONGO_MIN_CARD_PESOS.toFixed(2)} for card payments.`);
+      }
+      const digits = cardNumber.replace(/\D/g, '');
+      if (digits.length < 12) throw new Error('Enter a valid card number.');
+      const month = parseInt(expMonth, 10);
+      const yearIn = parseInt(expYear, 10);
+      if (!month || month < 1 || month > 12) throw new Error('Enter a valid expiry month (01–12).');
+      if (!Number.isFinite(yearIn) || yearIn < 0) throw new Error('Enter a valid expiry year.');
+      const cvcDigits = cvc.replace(/\D/g, '');
+      if (cvcDigits.length < 3) throw new Error('Enter the security code on your card.');
 
-      // 2. Confirm card payment in the browser
-      const cardNumber = elements.getElement(CardNumberElement);
-      if (!cardNumber) throw new Error('Card fields not ready');
-
-      const { error, paymentIntent } = await stripe.confirmCardPayment(clientSecret, {
-        payment_method: {
-          card: cardNumber,
-          billing_details: { name: cardName || undefined },
-        },
+      const pi = await createCardPaymentIntent(total);
+      const pm = await createCardPaymentMethod({
+        cardNumber: digits,
+        expMonth: month,
+        expYear: yearIn,
+        cvc: cvcDigits,
+        billingName: cardName || undefined,
       });
 
-      if (error) throw new Error(error.message ?? 'Card payment failed');
-      if (paymentIntent?.status !== 'succeeded') throw new Error('Payment not completed');
+      const returnUrl = `${window.location.origin}/payment?card_pi=${encodeURIComponent(pi.id)}`;
+      let intent = await attachPaymentMethodToIntent(pi.id, pm.id, returnUrl);
 
-      // 3. Save order to Supabase
-      const pts = await saveOrder({ cart, total, userId, paymentMethod: 'card', sourceId: paymentIntent.id });
+      const payErr = intent.attributes.last_payment_error?.message;
+      if (intent.attributes.status !== 'awaiting_next_action' && payErr) {
+        throw new Error(payErr);
+      }
+
+      if (intent.attributes.status === 'processing') {
+        intent = await retrievePaymentIntentWhenReady(pi.id);
+      }
+
+      if (intent.attributes.status === 'awaiting_next_action') {
+        const na = intent.attributes.next_action;
+        if (na?.type === 'redirect' && na.redirect?.url) {
+          savePendingOrder({ cart, total, userId, paymentMethod: 'card', sourceId: pi.id });
+          window.location.assign(na.redirect.url);
+          return;
+        }
+        throw new Error('This card requires authentication but no bank URL was returned. Try another card.');
+      }
+
+      if (intent.attributes.status !== 'succeeded') {
+        const msg = intent.attributes.last_payment_error?.message;
+        throw new Error(msg ?? `Payment was not completed (status: ${intent.attributes.status}).`);
+      }
+
+      const pts = await saveOrder({
+        cart,
+        total,
+        userId,
+        paymentMethod: 'card',
+        sourceId: pi.id,
+      });
       sessionStorage.removeItem(CART_STATE_KEY);
       onSuccess(pts);
-    } catch (err: any) {
-      onError(err.message ?? 'Card payment failed. Please try again.');
+    } catch (err: unknown) {
+      onError(err instanceof Error ? err.message : 'Card payment failed. Please try again.');
     } finally {
       setProcessing(false);
     }
@@ -135,7 +163,6 @@ function StripeCardForm({
       exit={{ opacity: 0, y: -8 }}
       className="mt-4 space-y-4"
     >
-      {/* Decorative card preview strip */}
       <div className="relative h-28 bg-gradient-to-br from-[#7b6a6c] to-[#4a3b3d] rounded-2xl overflow-hidden flex items-end p-5 shadow-lg">
         <div className="absolute top-4 left-5 flex gap-1.5">
           {[...Array(3)].map((_, i) => (
@@ -151,11 +178,9 @@ function StripeCardForm({
             {cardName || 'YOUR NAME'}
           </p>
         </div>
-        {/* Shine */}
         <div className="absolute inset-0 bg-gradient-to-tr from-transparent via-white/5 to-transparent pointer-events-none" />
       </div>
 
-      {/* Card Holder Name */}
       <div>
         <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1.5">
           Card Holder Name
@@ -168,55 +193,86 @@ function StripeCardForm({
           onFocus={() => setFocusedField('name')}
           onBlur={() => setFocusedField(null)}
           className={fieldClass('name') + ' text-sm outline-none'}
+          autoComplete="cc-name"
         />
       </div>
 
-      {/* Card Number */}
       <div>
         <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1.5">
           Card Number
         </label>
-        <div className={fieldClass('number')}>
-          <CardNumberElement
-            options={{ style: stripeElementStyle, showIcon: true }}
-            onFocus={() => setFocusedField('number')}
+        <input
+          type="text"
+          inputMode="numeric"
+          autoComplete="cc-number"
+          placeholder="1234 5678 9012 3456"
+          value={formatCardDisplay(cardNumber)}
+          onChange={(e) => setCardNumber(e.target.value.replace(/\D/g, '').slice(0, 19))}
+          onFocus={() => setFocusedField('number')}
+          onBlur={() => setFocusedField(null)}
+          className={fieldClass('number') + ' text-sm outline-none font-mono'}
+        />
+      </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        <div>
+          <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1.5">
+            Expiry (MM)
+          </label>
+          <input
+            type="text"
+            inputMode="numeric"
+            autoComplete="cc-exp-month"
+            placeholder="MM"
+            maxLength={2}
+            value={expMonth}
+            onChange={(e) => setExpMonth(e.target.value.replace(/\D/g, '').slice(0, 2))}
+            onFocus={() => setFocusedField('expiry')}
             onBlur={() => setFocusedField(null)}
+            className={fieldClass('expiry') + ' text-sm outline-none font-mono'}
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1.5">
+            Year (YY)
+          </label>
+          <input
+            type="text"
+            inputMode="numeric"
+            autoComplete="cc-exp-year"
+            placeholder="YY"
+            maxLength={2}
+            value={expYear}
+            onChange={(e) => setExpYear(e.target.value.replace(/\D/g, '').slice(0, 2))}
+            onFocus={() => setFocusedField('year')}
+            onBlur={() => setFocusedField(null)}
+            className={fieldClass('year') + ' text-sm outline-none font-mono'}
           />
         </div>
       </div>
 
-      {/* Expiry & CVC */}
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1.5">
-            Expiry Date
-          </label>
-          <div className={fieldClass('expiry')}>
-            <CardExpiryElement
-              options={{ style: stripeElementStyle }}
-              onFocus={() => setFocusedField('expiry')}
-              onBlur={() => setFocusedField(null)}
-            />
-          </div>
-        </div>
-        <div>
-          <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1.5">
-            CVC
-          </label>
-          <div className={fieldClass('cvc')}>
-            <CardCvcElement
-              options={{ style: stripeElementStyle }}
-              onFocus={() => setFocusedField('cvc')}
-              onBlur={() => setFocusedField(null)}
-            />
-          </div>
-        </div>
+      <div>
+        <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1.5">
+          CVC
+        </label>
+        <input
+          type="text"
+          inputMode="numeric"
+          autoComplete="cc-csc"
+          placeholder="123"
+          maxLength={4}
+          value={cvc}
+          onChange={(e) => setCvc(e.target.value.replace(/\D/g, '').slice(0, 4))}
+          onFocus={() => setFocusedField('cvc')}
+          onBlur={() => setFocusedField(null)}
+          className={fieldClass('cvc') + ' text-sm outline-none font-mono'}
+        />
       </div>
 
-      {/* Pay Button */}
       <button
+        type="button"
         onClick={handlePay}
-        disabled={processing || !stripe}
+        disabled={processing}
         className="w-full py-4 bg-[#7b6a6c] hover:bg-[#6a5b5d] disabled:bg-stone-300 disabled:cursor-not-allowed text-white rounded-2xl font-bold shadow-lg shadow-[#7b6a6c]/20 transition-all flex items-center justify-center gap-2 mt-2"
       >
         {processing ? (
@@ -232,10 +288,11 @@ function StripeCardForm({
         )}
       </button>
 
-      {/* Trust badges */}
-      <div className="flex items-center justify-center gap-2 text-stone-400 text-xs">
-        <ShieldCheck className="w-4 h-4 text-green-400" />
-        Secured by Stripe · 256-bit SSL encryption
+      <div className="flex items-center justify-center gap-2 text-stone-400 text-xs text-center leading-relaxed">
+        <ShieldCheck className="w-4 h-4 text-green-400 shrink-0" />
+        <span>
+          Cards are processed by PayMongo. If your bank requires 3D Secure, you will be redirected to verify the payment, then returned here.
+        </span>
       </div>
     </motion.div>
   );
@@ -374,9 +431,6 @@ export default function PaymentDashboard() {
   const [gcashRedirecting, setGcashRedirecting] = useState(false);
   const [pointsEarned, setPointsEarned] = useState(0);
 
-  // Stripe Elements provider state
-  const [stripePromise] = useState(() => getStripe());
-
   // ── Return from GCash redirect ───────────────────────────────────────────
   // Guard ref — ensures saveOrder is called at most once even in React 18
   // Strict Mode (which double-invokes effects in development).
@@ -415,6 +469,75 @@ export default function PaymentDashboard() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const cardPiParam = searchParams.get('card_pi');
+
+  // ── Return from PayMongo 3D Secure redirect ─────────────────────────────
+  useEffect(() => {
+    if (!cardPiParam) return;
+
+    const doneKey = `paymongo_card_done_${cardPiParam}`;
+    if (sessionStorage.getItem(doneKey)) {
+      navigate({ pathname: '/payment', search: '' }, { replace: true });
+      return;
+    }
+
+    const workKey = `paymongo_card_work_${cardPiParam}`;
+    if (sessionStorage.getItem(workKey)) return;
+    sessionStorage.setItem(workKey, '1');
+
+    (async () => {
+      try {
+        const intent = await retrievePaymentIntent(cardPiParam);
+
+        if (intent.attributes.status !== 'succeeded') {
+          sessionStorage.removeItem(workKey);
+          clearPendingOrder();
+          setErrorMsg(
+            intent.attributes.last_payment_error?.message ??
+              'Card authentication did not complete. Please try again.',
+          );
+          setIsFailed(true);
+          navigate({ pathname: '/payment', search: '' }, { replace: true });
+          return;
+        }
+
+        const pending = loadPendingOrder();
+        if (!pending || pending.sourceId !== cardPiParam) {
+          sessionStorage.removeItem(workKey);
+          clearPendingOrder();
+          setErrorMsg(
+            'Your payment may have succeeded, but this checkout session could not be restored. Please contact support with your receipt.',
+          );
+          setIsFailed(true);
+          navigate({ pathname: '/payment', search: '' }, { replace: true });
+          return;
+        }
+
+        clearPendingOrder();
+        const pts = await saveOrder({
+          ...pending,
+          paymentMethod: 'card',
+          sourceId: cardPiParam,
+        });
+
+        sessionStorage.setItem(doneKey, '1');
+        sessionStorage.removeItem(workKey);
+
+        setPointsEarned(pts);
+        setIsSuccess(true);
+        sessionStorage.removeItem(CART_STATE_KEY);
+        navigate({ pathname: '/payment', search: '' }, { replace: true });
+        setTimeout(() => navigate('/', { replace: true }), 4000);
+      } catch (e: unknown) {
+        sessionStorage.removeItem(workKey);
+        clearPendingOrder();
+        setErrorMsg(e instanceof Error ? e.message : 'Could not verify card payment.');
+        setIsFailed(true);
+        navigate({ pathname: '/payment', search: '' }, { replace: true });
+      }
+    })();
+  }, [cardPiParam, navigate]);
 
   // ── GCash / Counter payment handler ─────────────────────────────────────
   const handleNonCardPayment = async () => {
@@ -455,14 +578,13 @@ export default function PaymentDashboard() {
     }
   };
 
-  // Stripe callbacks
-  const handleStripeSuccess = useCallback((pts: number) => {
+  const handleCardSuccess = useCallback((pts: number) => {
     setPointsEarned(pts);
     setIsSuccess(true);
     setTimeout(() => navigate('/', { replace: true }), 4000);
   }, [navigate]);
 
-  const handleStripeError = useCallback((msg: string) => {
+  const handleCardError = useCallback((msg: string) => {
     setErrorMsg(msg);
   }, []);
 
@@ -599,9 +721,9 @@ export default function PaymentDashboard() {
             <PaymentOption
               id="card"
               title="Credit or Debit Card"
-              description="Visa, Mastercard, JCB, or Amex — powered by Stripe."
+              description="Visa, Mastercard, JCB, or Amex — processed by PayMongo (minimum ₱20)."
               icon={<CreditCard className="w-6 h-6" />}
-              badge={<span className="text-xs font-bold text-purple-600 bg-purple-50 px-2 py-0.5 rounded-full flex items-center gap-1"><Lock className="w-3 h-3" /> Stripe Secure</span>}
+              badge={<span className="text-xs font-bold text-purple-600 bg-purple-50 px-2 py-0.5 rounded-full flex items-center gap-1"><Lock className="w-3 h-3" /> PayMongo</span>}
               selected={selectedMethod === 'card'}
               onClick={() => setSelectedMethod('card')}
             />
@@ -643,14 +765,12 @@ export default function PaymentDashboard() {
                 exit={{ opacity: 0, y: -8 }}
                 className="bg-white border border-stone-100 rounded-3xl p-6 shadow-lg shadow-stone-100/50"
               >
-                <Elements stripe={stripePromise}>
-                  <StripeCardFormWrapper
-                    total={total}
-                    cart={cart}
-                    onSuccess={handleStripeSuccess}
-                    onError={handleStripeError}
-                  />
-                </Elements>
+                <PayMongoCardFormWrapper
+                  total={total}
+                  cart={cart}
+                  onSuccess={handleCardSuccess}
+                  onError={handleCardError}
+                />
               </motion.div>
             )}
           </AnimatePresence>
@@ -733,7 +853,7 @@ export default function PaymentDashboard() {
 }
 
 // ── Wrapper to inject userId from session ──────────────────────────────────
-function StripeCardFormWrapper({
+function PayMongoCardFormWrapper({
   total,
   cart,
   onSuccess,
@@ -753,7 +873,7 @@ function StripeCardFormWrapper({
   }, []);
 
   return (
-    <StripeCardForm
+    <PayMongoCardForm
       total={total}
       cart={cart}
       userId={userId}
