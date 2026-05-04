@@ -10,7 +10,8 @@ import {
   Inventory, 
   Promo, 
   SalesReport, 
-  AdminLog 
+  AdminLog,
+  StaffLoginLog,
 } from '../types/database';
 
 export const useAdminController = () => {
@@ -23,6 +24,7 @@ export const useAdminController = () => {
   const [promos, setPromos] = useState<Promo[]>([]);
   const [salesReports, setSalesReports] = useState<SalesReport[]>([]);
   const [adminLogs, setAdminLogs] = useState<AdminLog[]>([]);
+  const [loginLogs, setLoginLogs] = useState<StaffLoginLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -89,9 +91,19 @@ export const useAdminController = () => {
       .from('admin_logs')
       .select('*')
       .order('created_at', { ascending: false })
-      .limit(50);
+      .limit(100);
     if (error) { console.error('[Admin] fetchAdminLogs error:', error.message); return; }
     setAdminLogs(data || []);
+  };
+
+  const fetchLoginLogs = async () => {
+    const { data, error } = await supabase
+      .from('staff_login_logs')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error) { console.error('[Admin] fetchLoginLogs error:', error.message); return; }
+    setLoginLogs(data || []);
   };
 
   useEffect(() => {
@@ -153,6 +165,13 @@ export const useAdminController = () => {
       })
       .subscribe();
 
+    const loginLogsChannel = supabase
+      .channel('staff-login-logs-realtime')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'staff_login_logs' }, () => {
+        fetchLoginLogs();
+      })
+      .subscribe();
+
     return () => {
       supabase.removeChannel(ordersChannel);
       supabase.removeChannel(productsChannel);
@@ -161,6 +180,7 @@ export const useAdminController = () => {
       supabase.removeChannel(promosChannel);
       supabase.removeChannel(paymentsChannel);
       supabase.removeChannel(adminLogsChannel);
+      supabase.removeChannel(loginLogsChannel);
     };
   }, []);
 
@@ -231,11 +251,23 @@ export const useAdminController = () => {
         .from('admin_logs')
         .select('*')
         .order('created_at', { ascending: false })
-        .limit(50);
+        .limit(100);
       if (!adminLogsRes.error) setAdminLogs(adminLogsRes.data || []);
       else console.warn('[Admin] admin_logs fetch failed (non-critical):', adminLogsRes.error.message);
     } catch (e) {
       console.warn('[Admin] admin_logs fetch exception (non-critical):', e);
+    }
+
+    try {
+      const loginLogsRes = await supabase
+        .from('staff_login_logs')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(100);
+      if (!loginLogsRes.error) setLoginLogs(loginLogsRes.data || []);
+      else console.warn('[Admin] staff_login_logs fetch failed (non-critical):', loginLogsRes.error.message);
+    } catch (e) {
+      console.warn('[Admin] staff_login_logs fetch exception (non-critical):', e);
     }
   };
 
@@ -379,6 +411,7 @@ export const useAdminController = () => {
     promos,
     salesReports,
     adminLogs,
+    loginLogs,
     loading,
     error,
     lastUpdated,

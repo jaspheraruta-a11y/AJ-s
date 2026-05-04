@@ -12,6 +12,14 @@ CREATE TABLE public.admin_logs (
   CONSTRAINT admin_logs_pkey PRIMARY KEY (id),
   CONSTRAINT admin_logs_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id)
 );
+CREATE TABLE public.staff_login_logs (
+  id uuid NOT NULL DEFAULT uuid_generate_v4(),
+  user_id uuid NOT NULL,
+  method text,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT staff_login_logs_pkey PRIMARY KEY (id),
+  CONSTRAINT staff_login_logs_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+);
 CREATE TABLE public.categories (
   id uuid NOT NULL DEFAULT uuid_generate_v4(),
   name text NOT NULL,

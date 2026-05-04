@@ -132,3 +132,10 @@ export interface AdminLog {
   created_at: string;
 }
 
+export interface StaffLoginLog {
+  id: string;
+  user_id: string;
+  method?: string | null;
+  created_at: string;
+}
+

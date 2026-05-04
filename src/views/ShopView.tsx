@@ -7,6 +7,7 @@ import { Category, Product, Profile, ProductSize } from '../types/database';
 import Logo from '../components/Logo';
 import { supabase } from '../supabase';
 import LoginModal from '../components/LoginModal';
+import { recordStaffSignIn } from '../lib/recordStaffSignIn';
 import ProductModal from '../components/ProductModal';
 import UserAgreementModal, { useAgreementModal } from '../components/UserAgreementModal';
 
@@ -845,7 +846,10 @@ export default function ShopView() {
       }
     });
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_IN' && session) {
+        void recordStaffSignIn(event, session);
+      }
       if (session?.user) {
         fetchProfile(session.user.id);
       } else {
