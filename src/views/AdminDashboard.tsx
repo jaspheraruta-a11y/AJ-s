@@ -43,11 +43,25 @@ import {
   CheckSquare,
   ClipboardList,
   History,
-  KeyRound
+  KeyRound,
+  CreditCard,
 } from 'lucide-react';
+import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { useStaffPermissions, useStatusChangeCooldown, TabId } from '../contexts/StaffPermissionsContext';
 import { useAdminController, useOrderManagement } from '../controllers/admin';
 import { Order, Product, Profile, AdminLog } from '../types/database';
+import {
+  createCardPaymentIntent,
+  createCardPaymentMethod,
+  attachPaymentMethodToIntent,
+  retrievePaymentIntent,
+  retrievePaymentIntentWhenReady,
+  PAYMONGO_MIN_CARD_PESOS,
+} from '../services/paymongo';
+
+const COUNTER_CARD_PENDING_KEY = 'counter_orders_card_pending';
+
+const simpleEmailValid = (s: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
 
 // ── PDF / print report (Orders) ───────────────────────────────────────────────
 const REPORT_BRAND = {
@@ -509,9 +523,24 @@ interface AdminDashboardProps {
   mode?: 'admin' | 'staff';
 }
 
+type CounterOrderSnapshot = {
+  customerName: string;
+  total: number;
+  items: {
+    productId: string;
+    productName: string;
+    size: string | null;
+    quantity: number;
+    unitPrice: number;
+    lineTotal: number;
+  }[];
+};
 
 const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 'admin' }) => {
   const isStaff = mode === 'staff';
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const location = useLocation();
   const [activeTab, setActiveTab] = useState('overview');
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
@@ -741,7 +770,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
   const [counterCustomerName, setCounterCustomerName] = useState('');
   const [counterSearchTerm, setCounterSearchTerm] = useState('');
   const [counterCategoryFilter, setCounterCategoryFilter] = useState('all');
-  const [counterPaymentMethod, setCounterPaymentMethod] = useState<'cash' | 'card' | 'gcash' | 'paymaya'>('cash');
+  const [counterPaymentMethod, setCounterPaymentMethod] = useState<'cash' | 'card'>('cash');
   const [counterPlacing, setCounterPlacing] = useState(false);
   const [counterSuccessMsg, setCounterSuccessMsg] = useState<string | null>(null);
   const [counterProductSizes, setCounterProductSizes] = useState<Record<string, { name: string; price_modifier: number }[]>>({});
@@ -749,6 +778,12 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
   // ── Counter Orders Payment Modal state ───────────────────────────────────
   const [showCounterPayModal, setShowCounterPayModal] = useState(false);
   const [counterAmountPaid, setCounterAmountPaid] = useState('');
+  const [counterCardEmail, setCounterCardEmail] = useState('');
+  const [counterCardName, setCounterCardName] = useState('');
+  const [counterCardNumber, setCounterCardNumber] = useState('');
+  const [counterCardExpMonth, setCounterCardExpMonth] = useState('');
+  const [counterCardExpYear, setCounterCardExpYear] = useState('');
+  const [counterCardCvc, setCounterCardCvc] = useState('');
 
   // Canonical sizes always shown in counter tab (regardless of DB state)
   // Medium = base price (0 modifier), Large = +10, Small = 0 (same as Medium)
@@ -827,25 +862,47 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
 
   const counterCartTotal = counterCart.reduce((sum, c) => sum + (c.product.price + c.sizePrice) * c.quantity, 0);
 
-  const handlePlaceCounterOrder = async (paidAmount: number) => {
-    if (counterCart.length === 0) return;
-    setCounterPlacing(true);
-    try {
-      const { supabase: sb } = await import('../supabase');
+  const buildCounterSnapshot = (cart: CartItem[], customerName: string, total: number): CounterOrderSnapshot => ({
+    customerName,
+    total,
+    items: cart.map((c) => ({
+      productId: c.product.id,
+      productName: c.product.name + (c.size ? ` (${c.size})` : ''),
+      size: c.size ?? null,
+      quantity: c.quantity,
+      unitPrice: c.product.price + c.sizePrice,
+      lineTotal: (c.product.price + c.sizePrice) * c.quantity,
+    })),
+  });
 
-      // 1. Generate order number
+  const closeCounterPayModal = () => {
+    setShowCounterPayModal(false);
+    setCounterAmountPaid('');
+    setCounterCardEmail('');
+    setCounterCardName('');
+    setCounterCardNumber('');
+    setCounterCardExpMonth('');
+    setCounterCardExpYear('');
+    setCounterCardCvc('');
+  };
+
+  const commitCounterOrderFromSnapshot = useCallback(
+    async (
+      snapshot: CounterOrderSnapshot,
+      opts: { paidAmount: number; method: 'cash' | 'card'; referenceNumber?: string | null },
+    ): Promise<string> => {
+      const { supabase: sb } = await import('../supabase');
       const orderNum = `CO-${Date.now().toString().slice(-6)}`;
 
-      // 2. Insert order — status goes directly to 'preparing' since payment is collected upfront
       const { data: orderData, error: orderErr } = await sb.from('orders').insert({
         order_number: orderNum,
         user_id: null,
         status: 'preparing',
         order_type: 'walkin',
-        subtotal: counterCartTotal,
+        subtotal: snapshot.total,
         discount_amount: 0,
-        total: counterCartTotal,
-        customer_notes: counterCustomerName ? `Counter order – ${counterCustomerName}` : 'Counter order',
+        total: snapshot.total,
+        customer_notes: snapshot.customerName ? `Counter order – ${snapshot.customerName}` : 'Counter order',
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       }).select('id').single();
@@ -853,45 +910,238 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
       if (orderErr) throw orderErr;
       const orderId = orderData.id;
 
-      // 3. Insert order items
-      const itemRows = counterCart.map(c => ({
+      const itemRows = snapshot.items.map((c) => ({
         order_id: orderId,
-        product_id: c.product.id,
-        product_name: c.product.name + (c.size ? ` (${c.size})` : ''),
-        size: c.size || null,
+        product_id: c.productId,
+        product_name: c.productName,
+        size: c.size,
         quantity: c.quantity,
-        unit_price: c.product.price + c.sizePrice,
-        line_total: (c.product.price + c.sizePrice) * c.quantity,
+        unit_price: c.unitPrice,
+        line_total: c.lineTotal,
       }));
       const { error: itemErr } = await sb.from('order_items').insert(itemRows);
       if (itemErr) throw itemErr;
 
-      // 4. Insert payment record — marked as paid immediately (staff collected at counter)
       const { error: payErr } = await sb.from('payments').insert({
         order_id: orderId,
-        method: counterPaymentMethod,
+        method: opts.method,
         status: 'paid',
-        amount: paidAmount,
+        amount: opts.paidAmount,
+        reference_number: opts.referenceNumber ?? null,
         paid_at: new Date().toISOString(),
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       });
       if (payErr) throw payErr;
 
-      // 5. Reset form & close modal
-      setShowCounterPayModal(false);
-      setCounterAmountPaid('');
+      refreshData();
+      return orderNum;
+    },
+    [refreshData],
+  );
+
+  const formatCounterCardDisplay = (raw: string) => {
+    const d = raw.replace(/\D/g, '').slice(0, 19);
+    return d.replace(/(\d{4})(?=\d)/g, '$1 ').trim();
+  };
+
+  const handlePlaceCounterOrder = async () => {
+    if (counterCart.length === 0) return;
+    const snapshot = buildCounterSnapshot(counterCart, counterCustomerName, counterCartTotal);
+
+    if (counterPaymentMethod === 'cash') {
+      const paid = parseFloat(counterAmountPaid);
+      if (isNaN(paid) || paid < counterCartTotal) return;
+      setCounterPlacing(true);
+      try {
+        const orderNum = await commitCounterOrderFromSnapshot(snapshot, {
+          paidAmount: paid,
+          method: 'cash',
+        });
+        closeCounterPayModal();
+        setCounterCart([]);
+        setCounterCustomerName('');
+        setCounterSuccessMsg(`✅ Order ${orderNum} placed & paid — change: ₱${(paid - counterCartTotal).toFixed(2)}`);
+        setTimeout(() => setCounterSuccessMsg(null), 6000);
+      } catch (err: any) {
+        alert(`Failed to place counter order: ${err.message}`);
+      } finally {
+        setCounterPlacing(false);
+      }
+      return;
+    }
+
+    if (counterCartTotal + 1e-9 < PAYMONGO_MIN_CARD_PESOS) {
+      alert(`Card payments require a minimum of ₱${PAYMONGO_MIN_CARD_PESOS.toFixed(2)}.`);
+      return;
+    }
+    const digits = counterCardNumber.replace(/\D/g, '');
+    if (digits.length < 12) {
+      alert('Enter a valid card number.');
+      return;
+    }
+    const month = parseInt(counterCardExpMonth, 10);
+    const yearIn = parseInt(counterCardExpYear, 10);
+    if (!month || month < 1 || month > 12) {
+      alert('Enter a valid expiry month (01–12).');
+      return;
+    }
+    if (!Number.isFinite(yearIn) || yearIn < 0) {
+      alert('Enter a valid expiry year.');
+      return;
+    }
+    const cvcDigits = counterCardCvc.replace(/\D/g, '');
+    if (cvcDigits.length < 3) {
+      alert('Enter the security code on the card.');
+      return;
+    }
+    if (!simpleEmailValid(counterCardEmail)) {
+      alert('Enter a valid billing email (required by the card processor).');
+      return;
+    }
+
+    setCounterPlacing(true);
+    try {
+      const pi = await createCardPaymentIntent(counterCartTotal);
+      const pm = await createCardPaymentMethod({
+        cardNumber: digits,
+        expMonth: month,
+        expYear: yearIn,
+        cvc: cvcDigits,
+        billingEmail: counterCardEmail.trim(),
+        billingName: counterCardName.trim() || undefined,
+      });
+      const returnUrl = `${window.location.origin}${location.pathname}?counter_card_pi=${encodeURIComponent(pi.id)}`;
+      let intent = await attachPaymentMethodToIntent(pi.id, pm.id, returnUrl);
+
+      const payErrEarly = intent.attributes.last_payment_error?.message;
+      if (intent.attributes.status !== 'awaiting_next_action' && payErrEarly) {
+        throw new Error(payErrEarly);
+      }
+
+      if (intent.attributes.status === 'processing') {
+        intent = await retrievePaymentIntentWhenReady(pi.id);
+      }
+
+      if (intent.attributes.status === 'awaiting_next_action') {
+        const na = intent.attributes.next_action;
+        if (na?.type === 'redirect' && na.redirect?.url) {
+          sessionStorage.setItem(
+            COUNTER_CARD_PENDING_KEY,
+            JSON.stringify({ paymentIntentId: pi.id, snapshot }),
+          );
+          window.location.assign(na.redirect.url);
+          return;
+        }
+        throw new Error('This card requires authentication but no bank URL was returned. Try another card.');
+      }
+
+      if (intent.attributes.status !== 'succeeded') {
+        const msg = intent.attributes.last_payment_error?.message;
+        throw new Error(msg ?? `Payment was not completed (status: ${intent.attributes.status}).`);
+      }
+
+      const orderNum = await commitCounterOrderFromSnapshot(snapshot, {
+        paidAmount: counterCartTotal,
+        method: 'card',
+        referenceNumber: pi.id,
+      });
+      closeCounterPayModal();
       setCounterCart([]);
       setCounterCustomerName('');
-      setCounterSuccessMsg(`✅ Order ${orderNum} placed & paid — change: ₱${(paidAmount - counterCartTotal).toFixed(2)}`);
+      setCounterSuccessMsg(`✅ Order ${orderNum} placed & paid by card.`);
       setTimeout(() => setCounterSuccessMsg(null), 6000);
-      refreshData();
     } catch (err: any) {
-      alert(`Failed to place counter order: ${err.message}`);
+      alert(err?.message ? `Card payment failed: ${err.message}` : 'Card payment failed.');
     } finally {
       setCounterPlacing(false);
     }
   };
+
+  const counterCardPiParam = searchParams.get('counter_card_pi');
+
+  useEffect(() => {
+    if (!counterCardPiParam) return;
+
+    const doneKey = `counter_card_done_${counterCardPiParam}`;
+    if (sessionStorage.getItem(doneKey)) {
+      navigate({ pathname: location.pathname, search: '' }, { replace: true });
+      setActiveTab('counter');
+      return;
+    }
+
+    const workKey = `counter_card_work_${counterCardPiParam}`;
+    if (sessionStorage.getItem(workKey)) return;
+    sessionStorage.setItem(workKey, '1');
+
+    (async () => {
+      try {
+        let intent = await retrievePaymentIntent(counterCardPiParam);
+        if (intent.attributes.status === 'processing') {
+          intent = await retrievePaymentIntentWhenReady(counterCardPiParam);
+        }
+        if (intent.attributes.status !== 'succeeded') {
+          sessionStorage.removeItem(workKey);
+          sessionStorage.removeItem(COUNTER_CARD_PENDING_KEY);
+          alert(
+            intent.attributes.last_payment_error?.message ??
+              'Card authentication did not complete.',
+          );
+          navigate({ pathname: location.pathname, search: '' }, { replace: true });
+          setActiveTab('counter');
+          return;
+        }
+
+        const raw = sessionStorage.getItem(COUNTER_CARD_PENDING_KEY);
+        if (!raw) {
+          sessionStorage.removeItem(workKey);
+          alert(
+            'Payment may have succeeded, but this counter checkout session could not be restored. Check recent orders or contact support with the PayMongo reference.',
+          );
+          navigate({ pathname: location.pathname, search: '' }, { replace: true });
+          setActiveTab('counter');
+          return;
+        }
+        const pending = JSON.parse(raw) as { paymentIntentId: string; snapshot: CounterOrderSnapshot };
+        if (pending.paymentIntentId !== counterCardPiParam) {
+          sessionStorage.removeItem(workKey);
+          sessionStorage.removeItem(COUNTER_CARD_PENDING_KEY);
+          alert('Payment session mismatch. Verify the order in the orders list.');
+          navigate({ pathname: location.pathname, search: '' }, { replace: true });
+          setActiveTab('counter');
+          return;
+        }
+
+        const orderNum = await commitCounterOrderFromSnapshot(pending.snapshot, {
+          paidAmount: pending.snapshot.total,
+          method: 'card',
+          referenceNumber: counterCardPiParam,
+        });
+
+        sessionStorage.setItem(doneKey, '1');
+        sessionStorage.removeItem(workKey);
+        sessionStorage.removeItem(COUNTER_CARD_PENDING_KEY);
+
+        navigate({ pathname: location.pathname, search: '' }, { replace: true });
+        setActiveTab('counter');
+        setCounterSuccessMsg(`✅ Order ${orderNum} placed & paid by card (after verification).`);
+        setTimeout(() => setCounterSuccessMsg(null), 6000);
+      } catch (e: any) {
+        sessionStorage.removeItem(workKey);
+        sessionStorage.removeItem(COUNTER_CARD_PENDING_KEY);
+        alert(e?.message || 'Could not finalize card payment.');
+        navigate({ pathname: location.pathname, search: '' }, { replace: true });
+        setActiveTab('counter');
+      }
+    })();
+  }, [counterCardPiParam, commitCounterOrderFromSnapshot, navigate, location.pathname]);
+
+  useEffect(() => {
+    if (!showCounterPayModal) return;
+    if (user.email) {
+      setCounterCardEmail((prev) => (prev.trim() ? prev : user.email || ''));
+    }
+  }, [showCounterPayModal, user.email]);
 
   const handleStatusUpdate = async (orderId: string, newStatus: Order['status']) => {
     // Staff: enforce 5-second cooldown
@@ -1906,17 +2156,18 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
           <div className="bg-white rounded-2xl border border-stone-100 p-5">
             <p className="font-bold text-stone-700 text-sm mb-3">Payment Method</p>
             <div className="grid grid-cols-2 gap-2">
-              {(['cash', 'card', 'gcash', 'paymaya'] as const).map(m => (
+              {(['cash', 'card'] as const).map((m) => (
                 <button
                   key={m}
+                  type="button"
                   onClick={() => setCounterPaymentMethod(m)}
-                  className={`py-2 text-sm font-semibold rounded-xl border-2 capitalize transition-all ${
+                  className={`py-2 text-sm font-semibold rounded-xl border-2 transition-all ${
                     counterPaymentMethod === m
                       ? 'border-[#7b6a6c] bg-[#f5f0ef] text-[#7b6a6c]'
                       : 'border-stone-200 text-stone-500 hover:border-stone-300'
                   }`}
                 >
-                  {m}
+                  {m === 'cash' ? 'Cash' : 'Card'}
                 </button>
               ))}
             </div>
@@ -1929,7 +2180,11 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
               <span className="font-mono text-2xl font-bold text-stone-800">₱{counterCartTotal.toFixed(2)}</span>
             </div>
             <button
-              onClick={() => { setCounterAmountPaid(''); setShowCounterPayModal(true); }}
+              type="button"
+              onClick={() => {
+                setCounterAmountPaid(counterCartTotal > 0 ? counterCartTotal.toFixed(2) : '');
+                setShowCounterPayModal(true);
+              }}
               disabled={counterCart.length === 0 || counterPlacing}
               className="w-full py-3.5 bg-[#7b6a6c] hover:bg-[#6a5a5c] disabled:bg-stone-300 disabled:cursor-not-allowed text-white font-bold rounded-xl transition-colors flex items-center justify-center gap-2 shadow-lg shadow-stone-200"
             >
@@ -2429,28 +2684,37 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-6"
-            onClick={() => { setShowCounterPayModal(false); setCounterAmountPaid(''); }}
+            onClick={closeCounterPayModal}
           >
             <motion.div
               initial={{ scale: 0.9, opacity: 0, y: 20 }}
               animate={{ scale: 1, opacity: 1, y: 0 }}
               exit={{ scale: 0.9, opacity: 0, y: 20 }}
               onClick={(e) => e.stopPropagation()}
-              className="bg-white rounded-2xl w-full max-w-md overflow-hidden shadow-2xl"
+              className="bg-white rounded-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto shadow-2xl"
             >
               {/* Modal Header */}
               <div className="bg-gradient-to-r from-[#7b6a6c] to-[#9a8688] p-6 flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <div className="w-12 h-12 bg-white/20 rounded-xl flex items-center justify-center">
-                    <Banknote className="w-6 h-6 text-white" />
+                    {counterPaymentMethod === 'card' ? (
+                      <CreditCard className="w-6 h-6 text-white" />
+                    ) : (
+                      <Banknote className="w-6 h-6 text-white" />
+                    )}
                   </div>
                   <div>
                     <h3 className="text-lg font-bold text-white">Counter Payment</h3>
-                    <p className="text-white/70 text-xs mt-0.5">Collect payment before placing order</p>
+                    <p className="text-white/70 text-xs mt-0.5">
+                      {counterPaymentMethod === 'card'
+                        ? 'PayMongo card — billing details required'
+                        : 'Collect payment before placing order'}
+                    </p>
                   </div>
                 </div>
                 <button
-                  onClick={() => { setShowCounterPayModal(false); setCounterAmountPaid(''); }}
+                  type="button"
+                  onClick={closeCounterPayModal}
                   className="p-2 hover:bg-white/20 rounded-lg transition-colors"
                 >
                   <X className="w-5 h-5 text-white" />
@@ -2481,92 +2745,182 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
                 {/* Payment method */}
                 <div>
                   <p className="text-sm font-semibold text-stone-700 mb-2">Payment Method</p>
-                  <div className="grid grid-cols-4 gap-2">
-                    {(['cash', 'card', 'gcash', 'paymaya'] as const).map(m => (
+                  <div className="grid grid-cols-2 gap-2">
+                    {(['cash', 'card'] as const).map((m) => (
                       <button
                         key={m}
+                        type="button"
                         onClick={() => setCounterPaymentMethod(m)}
-                        className={`py-2 text-xs font-bold rounded-xl border-2 capitalize transition-all ${
+                        className={`py-2.5 text-sm font-bold rounded-xl border-2 transition-all ${
                           counterPaymentMethod === m
                             ? 'border-[#7b6a6c] bg-[#f5f0ef] text-[#7b6a6c]'
                             : 'border-stone-200 text-stone-500 hover:border-stone-300'
                         }`}
                       >
-                        {m}
+                        {m === 'cash' ? 'Cash' : 'Card (PayMongo)'}
                       </button>
                     ))}
                   </div>
                 </div>
 
-                {/* Amount paid (only relevant for cash) */}
-                <div>
-                  <label className="block text-sm font-semibold text-stone-700 mb-2">
-                    {counterPaymentMethod === 'cash' ? 'Amount Given by Customer' : 'Amount Charged'}
-                  </label>
-                  <div className="relative">
-                    <span className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-400 font-bold text-lg select-none">₱</span>
-                    <input
-                      type="number"
-                      min={counterCartTotal}
-                      step="0.01"
-                      value={counterAmountPaid}
-                      onChange={(e) => setCounterAmountPaid(e.target.value)}
-                      placeholder={`Min. ₱${counterCartTotal.toFixed(2)}`}
-                      className="w-full pl-9 pr-4 py-3.5 text-xl font-mono font-bold border-2 border-stone-200 rounded-xl focus:outline-none focus:border-[#7b6a6c] transition-colors"
-                      autoFocus
-                    />
-                  </div>
-                </div>
-
-                {/* Change display */}
-                <AnimatePresence>
-                  {counterAmountPaid !== '' && !isNaN(parseFloat(counterAmountPaid)) && (
-                    <motion.div
-                      key="counter-change"
-                      initial={{ opacity: 0, y: -8 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -8 }}
-                      className={`rounded-xl p-4 flex items-center justify-between border ${
-                        parseFloat(counterAmountPaid) >= counterCartTotal
-                          ? 'bg-emerald-50 border-emerald-200'
-                          : 'bg-red-50 border-red-200'
-                      }`}
-                    >
-                      <div className="flex items-center gap-2">
-                        {parseFloat(counterAmountPaid) >= counterCartTotal ? (
-                          <CheckCircle className="w-5 h-5 text-emerald-600" />
-                        ) : (
-                          <AlertCircle className="w-5 h-5 text-red-500" />
-                        )}
-                        <span className={`text-sm font-bold ${
-                          parseFloat(counterAmountPaid) >= counterCartTotal ? 'text-emerald-700' : 'text-red-700'
-                        }`}>
-                          {parseFloat(counterAmountPaid) >= counterCartTotal ? 'Change Due' : 'Insufficient Amount'}
-                        </span>
-                      </div>
-                      <span className={`font-mono text-2xl font-bold ${
-                        parseFloat(counterAmountPaid) >= counterCartTotal ? 'text-emerald-700' : 'text-red-600'
-                      }`}>
-                        {parseFloat(counterAmountPaid) >= counterCartTotal
-                          ? `₱${(parseFloat(counterAmountPaid) - counterCartTotal).toFixed(2)}`
-                          : `-₱${(counterCartTotal - parseFloat(counterAmountPaid)).toFixed(2)}`}
-                      </span>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-
-                {/* Quick cash shortcuts (cash only) */}
                 {counterPaymentMethod === 'cash' && (
-                  <div className="flex flex-wrap gap-2">
-                    {[counterCartTotal, Math.ceil(counterCartTotal / 50) * 50, Math.ceil(counterCartTotal / 100) * 100, Math.ceil(counterCartTotal / 500) * 500].filter((v, i, a) => a.indexOf(v) === i).map(amount => (
-                      <button
-                        key={amount}
-                        onClick={() => setCounterAmountPaid(amount.toFixed(2))}
-                        className="px-3 py-1.5 text-xs font-bold rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-700 transition-colors border border-stone-200"
-                      >
-                        ₱{amount.toFixed(0)}
-                      </button>
-                    ))}
+                  <>
+                    <div>
+                      <label className="block text-sm font-semibold text-stone-700 mb-2">Amount Given by Customer</label>
+                      <div className="relative">
+                        <span className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-400 font-bold text-lg select-none">₱</span>
+                        <input
+                          type="number"
+                          min={counterCartTotal}
+                          step="0.01"
+                          value={counterAmountPaid}
+                          onChange={(e) => setCounterAmountPaid(e.target.value)}
+                          placeholder={`Min. ₱${counterCartTotal.toFixed(2)}`}
+                          className="w-full pl-9 pr-4 py-3.5 text-xl font-mono font-bold border-2 border-stone-200 rounded-xl focus:outline-none focus:border-[#7b6a6c] transition-colors"
+                          autoFocus
+                        />
+                      </div>
+                    </div>
+
+                    <AnimatePresence>
+                      {counterAmountPaid !== '' && !isNaN(parseFloat(counterAmountPaid)) && (
+                        <motion.div
+                          key="counter-change"
+                          initial={{ opacity: 0, y: -8 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -8 }}
+                          className={`rounded-xl p-4 flex items-center justify-between border ${
+                            parseFloat(counterAmountPaid) >= counterCartTotal
+                              ? 'bg-emerald-50 border-emerald-200'
+                              : 'bg-red-50 border-red-200'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2">
+                            {parseFloat(counterAmountPaid) >= counterCartTotal ? (
+                              <CheckCircle className="w-5 h-5 text-emerald-600" />
+                            ) : (
+                              <AlertCircle className="w-5 h-5 text-red-500" />
+                            )}
+                            <span className={`text-sm font-bold ${
+                              parseFloat(counterAmountPaid) >= counterCartTotal ? 'text-emerald-700' : 'text-red-700'
+                            }`}>
+                              {parseFloat(counterAmountPaid) >= counterCartTotal ? 'Change Due' : 'Insufficient Amount'}
+                            </span>
+                          </div>
+                          <span className={`font-mono text-2xl font-bold ${
+                            parseFloat(counterAmountPaid) >= counterCartTotal ? 'text-emerald-700' : 'text-red-600'
+                          }`}>
+                            {parseFloat(counterAmountPaid) >= counterCartTotal
+                              ? `₱${(parseFloat(counterAmountPaid) - counterCartTotal).toFixed(2)}`
+                              : `-₱${(counterCartTotal - parseFloat(counterAmountPaid)).toFixed(2)}`}
+                          </span>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+
+                    <div className="flex flex-wrap gap-2">
+                      {[counterCartTotal, Math.ceil(counterCartTotal / 50) * 50, Math.ceil(counterCartTotal / 100) * 100, Math.ceil(counterCartTotal / 500) * 500].filter((v, i, a) => a.indexOf(v) === i).map((amount) => (
+                        <button
+                          key={amount}
+                          type="button"
+                          onClick={() => setCounterAmountPaid(amount.toFixed(2))}
+                          className="px-3 py-1.5 text-xs font-bold rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-700 transition-colors border border-stone-200"
+                        >
+                          ₱{amount.toFixed(0)}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {counterPaymentMethod === 'card' && (
+                  <div className="space-y-3 border border-stone-200 rounded-xl p-4 bg-stone-50/80">
+                    <div className="flex items-center gap-2 text-stone-700">
+                      <Lock className="w-4 h-4 text-[#7b6a6c]" />
+                      <p className="text-xs font-semibold">
+                        Charged amount is the order total (₱{counterCartTotal.toFixed(2)}). If the bank requires 3D Secure, you will be redirected and then returned here.
+                      </p>
+                    </div>
+                    {counterCartTotal + 1e-9 < PAYMONGO_MIN_CARD_PESOS && (
+                      <p className="text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                        PayMongo card payments need at least ₱{PAYMONGO_MIN_CARD_PESOS.toFixed(2)}. Add items or use cash.
+                      </p>
+                    )}
+                    <div>
+                      <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1">Billing email</label>
+                      <input
+                        type="email"
+                        value={counterCardEmail}
+                        onChange={(e) => setCounterCardEmail(e.target.value)}
+                        placeholder="customer@email.com"
+                        autoComplete="email"
+                        className="w-full px-3 py-2.5 border-2 border-stone-200 rounded-xl text-sm focus:outline-none focus:border-[#7b6a6c]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1">Name on card</label>
+                      <input
+                        type="text"
+                        value={counterCardName}
+                        onChange={(e) => setCounterCardName(e.target.value)}
+                        placeholder="As printed on card"
+                        autoComplete="cc-name"
+                        className="w-full px-3 py-2.5 border-2 border-stone-200 rounded-xl text-sm focus:outline-none focus:border-[#7b6a6c]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1">Card number</label>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        value={formatCounterCardDisplay(counterCardNumber)}
+                        onChange={(e) => setCounterCardNumber(e.target.value.replace(/\D/g, '').slice(0, 19))}
+                        placeholder="1234 5678 9012 3456"
+                        autoComplete="cc-number"
+                        className="w-full px-3 py-2.5 border-2 border-stone-200 rounded-xl text-sm font-mono focus:outline-none focus:border-[#7b6a6c]"
+                      />
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      <div>
+                        <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1">MM</label>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          maxLength={2}
+                          value={counterCardExpMonth}
+                          onChange={(e) => setCounterCardExpMonth(e.target.value.replace(/\D/g, '').slice(0, 2))}
+                          placeholder="MM"
+                          autoComplete="cc-exp-month"
+                          className="w-full px-3 py-2.5 border-2 border-stone-200 rounded-xl text-sm font-mono focus:outline-none focus:border-[#7b6a6c]"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1">YY</label>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          maxLength={2}
+                          value={counterCardExpYear}
+                          onChange={(e) => setCounterCardExpYear(e.target.value.replace(/\D/g, '').slice(0, 2))}
+                          placeholder="YY"
+                          autoComplete="cc-exp-year"
+                          className="w-full px-3 py-2.5 border-2 border-stone-200 rounded-xl text-sm font-mono focus:outline-none focus:border-[#7b6a6c]"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1">CVC</label>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          maxLength={4}
+                          value={counterCardCvc}
+                          onChange={(e) => setCounterCardCvc(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                          placeholder="123"
+                          autoComplete="cc-csc"
+                          className="w-full px-3 py-2.5 border-2 border-stone-200 rounded-xl text-sm font-mono focus:outline-none focus:border-[#7b6a6c]"
+                        />
+                      </div>
+                    </div>
                   </div>
                 )}
               </div>
@@ -2574,25 +2928,40 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
               {/* Actions */}
               <div className="px-6 pb-6 flex gap-3">
                 <button
-                  onClick={() => { setShowCounterPayModal(false); setCounterAmountPaid(''); }}
+                  type="button"
+                  onClick={closeCounterPayModal}
                   className="flex-1 py-3 border-2 border-stone-200 text-stone-600 rounded-xl font-semibold hover:bg-stone-50 transition-colors"
                 >
                   Back
                 </button>
                 <button
-                  onClick={() => handlePlaceCounterOrder(parseFloat(counterAmountPaid))}
+                  type="button"
+                  onClick={() => void handlePlaceCounterOrder()}
                   disabled={
                     counterPlacing ||
-                    !counterAmountPaid ||
-                    isNaN(parseFloat(counterAmountPaid)) ||
-                    parseFloat(counterAmountPaid) < counterCartTotal
+                    (counterPaymentMethod === 'cash'
+                      ? !counterAmountPaid ||
+                        isNaN(parseFloat(counterAmountPaid)) ||
+                        parseFloat(counterAmountPaid) < counterCartTotal
+                      : counterCartTotal + 1e-9 < PAYMONGO_MIN_CARD_PESOS ||
+                        counterCardNumber.replace(/\D/g, '').length < 12 ||
+                        !counterCardExpMonth ||
+                        !counterCardExpYear ||
+                        counterCardCvc.replace(/\D/g, '').length < 3 ||
+                        !simpleEmailValid(counterCardEmail))
                   }
                   className="flex-1 py-3 bg-[#7b6a6c] hover:bg-[#6a5a5c] disabled:bg-stone-300 disabled:cursor-not-allowed text-white rounded-xl font-semibold transition-colors flex items-center justify-center gap-2 shadow-lg shadow-stone-200"
                 >
                   {counterPlacing ? (
-                    <><RefreshCw className="w-4 h-4 animate-spin" /> Placing…</>
+                    <><RefreshCw className="w-4 h-4 animate-spin" /> {counterPaymentMethod === 'card' ? 'Processing…' : 'Placing…'}</>
                   ) : (
-                    <><CheckSquare className="w-4 h-4" /> Confirm & Place Order</>
+                    <>
+                      {counterPaymentMethod === 'card' ? (
+                        <><CreditCard className="w-4 h-4" /> Charge card & place order</>
+                      ) : (
+                        <><CheckSquare className="w-4 h-4" /> Confirm & place order</>
+                      )}
+                    </>
                   )}
                 </button>
               </div>
