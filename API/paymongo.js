@@ -1,16 +1,17 @@
 export default async function handler(req, res) {
-    // Only allow POST requests
+    const { target } = req.query;
+  
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed' });
     }
   
     try {
-      const response = await fetch('https://api.paymongo.com/v1/sources', {
+      const response = await fetch(`https://api.paymongo.com/v1/${target}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          // This uses the Secret Key you added to Vercel environment variables
-          'Authorization': `Basic ${Buffer.from(process.env.PAYMONGO_SECRET_KEY).toString('base64')}`
+          'Accept': 'application/json',
+          'Authorization': `Basic ${Buffer.from(process.env.PAYMONGO_SECRET_KEY + ':').toString('base64')}`
         },
         body: JSON.stringify(req.body)
       });
