@@ -1,17 +1,14 @@
 /**
  * PayMongo service utilities.
- * All requests go through the Vite dev-proxy at /api/paymongo
+ * All requests go through the Vercel Serverless Function at /api/paymongo
  * so the Secret Key is never exposed to the browser.
  */
 
-const PROXY_BASE = '/api/paymongo/v1';
+const PROXY_BASE = '/api/paymongo';
 
 /** Convert peso amount to centavos (PayMongo uses smallest unit) */
 export const toСentavos = (pesos: number) => Math.round(pesos * 100);
 
-/** -------------------------------------------------------------------
- *  SOURCES FLOW  (simplest – redirects user to GCash hosted page)
- * ------------------------------------------------------------------- */
 export interface CreateSourceParams {
   amount: number; // in pesos
   redirectSuccess: string;
@@ -36,6 +33,9 @@ export interface PayMongoSource {
   };
 }
 
+/** 
+ * SOURCES FLOW (GCash)
+ */
 export async function createGCashSource(params: CreateSourceParams): Promise<PayMongoSource> {
   const body = {
     data: {
@@ -52,7 +52,8 @@ export async function createGCashSource(params: CreateSourceParams): Promise<Pay
     },
   };
 
-  const res = await fetch(`${PROXY_BASE}/sources`, {
+  // We append ?target=sources so the Vercel proxy knows where to send it
+  const res = await fetch(`${PROXY_BASE}?target=sources`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -67,9 +68,9 @@ export async function createGCashSource(params: CreateSourceParams): Promise<Pay
   return json.data as PayMongoSource;
 }
 
-/** -------------------------------------------------------------------
- *  PAYMENT INTENTS FLOW  (for cards; included for future use)
- * ------------------------------------------------------------------- */
+/** 
+ * PAYMENT INTENTS FLOW (Cards)
+ */
 export async function createPaymentIntent(amountPesos: number) {
   const body = {
     data: {
@@ -82,7 +83,8 @@ export async function createPaymentIntent(amountPesos: number) {
     },
   };
 
-  const res = await fetch(`${PROXY_BASE}/payment_intents`, {
+  // We append ?target=payment_intents for card payments
+  const res = await fetch(`${PROXY_BASE}?target=payment_intents`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
