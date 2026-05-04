@@ -134,11 +134,19 @@ export async function createCardPaymentMethod(params: {
   expMonth: number;
   expYear: number;
   cvc: string;
+  /** PayMongo requires billing.email for card payment methods. */
+  billingEmail: string;
   billingName?: string;
+  billingPhone?: string;
 }): Promise<PayMongoPaymentMethod> {
   const digits = params.cardNumber.replace(/\D/g, '');
   let year = params.expYear;
   if (year < 100) year += 2000;
+
+  const email = params.billingEmail.trim();
+  if (!email) {
+    throw new Error('Email is required for card payments.');
+  }
 
   const body = {
     data: {
@@ -150,9 +158,11 @@ export async function createCardPaymentMethod(params: {
           exp_year: year,
           cvc: params.cvc.replace(/\s/g, ''),
         },
-        ...(params.billingName?.trim() && {
-          billing: { name: params.billingName.trim() },
-        }),
+        billing: {
+          email,
+          ...(params.billingName?.trim() && { name: params.billingName.trim() }),
+          ...(params.billingPhone?.trim() && { phone: params.billingPhone.trim() }),
+        },
       },
     },
   };

@@ -57,20 +57,25 @@ function clearPendingOrder() {
 const CART_STATE_KEY = 'payment_cart_state';
 
 // ── PayMongo card form (Payment Intents + Payment Methods; 3DS = full-page bank redirect) ──
+const simpleEmailValid = (s: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
+
 function PayMongoCardForm({
   total,
   cart,
   userId,
+  defaultBillingEmail,
   onSuccess,
   onError,
 }: {
   total: number;
   cart: any[];
   userId: string | null;
+  defaultBillingEmail?: string | null;
   onSuccess: (pts: number) => void;
   onError: (msg: string) => void;
 }) {
   const [processing, setProcessing] = useState(false);
+  const [billingEmail, setBillingEmail] = useState('');
   const [cardName, setCardName] = useState('');
   const [cardNumber, setCardNumber] = useState('');
   const [expMonth, setExpMonth] = useState('');
@@ -82,6 +87,12 @@ function PayMongoCardForm({
     const d = raw.replace(/\D/g, '').slice(0, 19);
     return d.replace(/(\d{4})(?=\d)/g, '$1 ').trim();
   };
+
+  useEffect(() => {
+    if (defaultBillingEmail?.trim()) {
+      setBillingEmail((prev) => (prev.trim() ? prev : defaultBillingEmail.trim()));
+    }
+  }, [defaultBillingEmail]);
 
   const handlePay = async () => {
     setProcessing(true);
@@ -97,6 +108,9 @@ function PayMongoCardForm({
       if (!Number.isFinite(yearIn) || yearIn < 0) throw new Error('Enter a valid expiry year.');
       const cvcDigits = cvc.replace(/\D/g, '');
       if (cvcDigits.length < 3) throw new Error('Enter the security code on your card.');
+      if (!simpleEmailValid(billingEmail)) {
+        throw new Error('Enter a valid email address (required by the card processor).');
+      }
 
       const pi = await createCardPaymentIntent(total);
       const pm = await createCardPaymentMethod({
@@ -104,6 +118,7 @@ function PayMongoCardForm({
         expMonth: month,
         expYear: yearIn,
         cvc: cvcDigits,
+        billingEmail: billingEmail.trim(),
         billingName: cardName || undefined,
       });
 
@@ -195,6 +210,23 @@ function PayMongoCardForm({
           className={fieldClass('name') + ' text-sm outline-none'}
           autoComplete="cc-name"
         />
+      </div>
+
+      <div>
+        <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1.5">
+          Email
+        </label>
+        <input
+          type="email"
+          placeholder="you@example.com"
+          value={billingEmail}
+          onChange={(e) => setBillingEmail(e.target.value)}
+          onFocus={() => setFocusedField('email')}
+          onBlur={() => setFocusedField(null)}
+          className={fieldClass('email') + ' text-sm outline-none'}
+          autoComplete="email"
+        />
+        <p className="text-[11px] text-stone-400 mt-1">Required for card verification and receipts.</p>
       </div>
 
       <div>
@@ -865,10 +897,12 @@ function PayMongoCardFormWrapper({
   onError: (msg: string) => void;
 }) {
   const [userId, setUserId] = useState<string | null>(null);
+  const [accountEmail, setAccountEmail] = useState<string | null>(null);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUserId(session?.user?.id ?? null);
+      setAccountEmail(session?.user?.email ?? null);
     });
   }, []);
 
@@ -877,6 +911,7 @@ function PayMongoCardFormWrapper({
       total={total}
       cart={cart}
       userId={userId}
+      defaultBillingEmail={accountEmail}
       onSuccess={onSuccess}
       onError={onError}
     />
