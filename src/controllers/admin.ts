@@ -435,8 +435,7 @@ export const useOrderManagement = () => {
       const { data, error } = await supabase
         .from('order_items')
         .select('*')
-        .eq('order_id', orderId)
-        .order('created_at', { ascending: false });
+        .eq('order_id', orderId);
 
       if (error) throw error;
       setOrderItems(data || []);

@@ -44,7 +44,6 @@ export interface Profile {
   avatar_url?: string;
   phone?: string;
   role: 'client' | 'admin' | 'staff';
-  address?: string;
   created_at: string;
   updated_at: string;
 }

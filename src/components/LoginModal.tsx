@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { X, Mail, Lock, Chrome, ArrowRight, Loader2, User, Phone, MapPin, Eye, EyeOff, ShieldCheck, Clock, KeyRound } from 'lucide-react';
+import { X, Mail, Lock, Chrome, ArrowRight, Loader2, User, Phone, Eye, EyeOff, ShieldCheck, Clock, KeyRound } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { supabase } from '../supabase';
 
@@ -111,7 +111,6 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
-  const [address, setAddress] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -133,6 +132,7 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
   });
   const [countdown, setCountdown] = useState<number>(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const stopClipboardAction = (e: React.ClipboardEvent<HTMLInputElement>) => e.preventDefault();
 
   // Update countdown every second while banned
   useEffect(() => {
@@ -182,6 +182,13 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
 
   const strength = useMemo(() => getPasswordStrength(password), [password]);
   const passwordsMatch = confirmPassword === '' ? null : password === confirmPassword;
+  const meetsPasswordPolicy =
+    password.length >= 8 &&
+    /[A-Z]/.test(password) &&
+    /[a-z]/.test(password) &&
+    /[0-9]/.test(password) &&
+    /[^A-Za-z0-9]/.test(password);
+  const isSignupSubmitDisabled = mode === 'signup' && (passwordsMatch !== true || !meetsPasswordPolicy);
 
   // reset fields when switching modes
   const switchMode = (next: 'login' | 'signup' | 'magic-link' | 'forgot-password') => {
@@ -191,7 +198,6 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
     setConfirmPassword('');
     setFullName('');
     setPhone('');
-    setAddress('');
     setShowPassword(false);
     setShowConfirmPassword(false);
   };
@@ -245,6 +251,19 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
           setLoading(false);
           return;
         }
+        if (!meetsPasswordPolicy) {
+          setMessage({
+            type: 'error',
+            text: 'Password must be at least 8 characters and include uppercase, lowercase, number, and symbol.',
+          });
+          setLoading(false);
+          return;
+        }
+        if (phone && (phone.length < 10 || phone.length > 11)) {
+          setMessage({ type: 'error', text: 'Please enter a valid phone number (10 to 11 digits only).' });
+          setLoading(false);
+          return;
+        }
         if (strength.score < 2) {
           setMessage({ type: 'error', text: 'Please choose a stronger password.' });
           setLoading(false);
@@ -261,7 +280,6 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
             email,
             full_name: fullName.trim() || null,
             phone: phone.trim() || null,
-            address: address.trim() || null,
             role: 'client',
           });
         }
@@ -460,6 +478,8 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                 </div>
                 <button
                   onClick={onClose}
+                  aria-label="Close authentication modal"
+                  title="Close"
                   style={{ padding: '0.4rem', borderRadius: '50%', background: 'transparent', border: 'none', cursor: 'pointer', color: '#a8a29e', transition: 'background 0.2s' }}
                   onMouseEnter={e => (e.currentTarget.style.background = '#f5f5f4')}
                   onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
@@ -578,6 +598,7 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                             required
                             value={fullName}
                             onChange={e => setFullName(e.target.value)}
+                            autoComplete="name"
                             placeholder="Juan dela Cruz"
                             style={inputStyle}
                             onFocus={e => { e.currentTarget.style.borderColor = '#7b6a6c'; e.currentTarget.style.boxShadow = '0 0 0 3px rgba(123,106,108,0.12)'; }}
@@ -595,6 +616,7 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                       required
                       value={email}
                       onChange={e => setEmail(e.target.value)}
+                      autoComplete="email"
                       placeholder="you@example.com"
                       style={inputStyle}
                       onFocus={e => { e.currentTarget.style.borderColor = '#7b6a6c'; e.currentTarget.style.boxShadow = '0 0 0 3px rgba(123,106,108,0.12)'; }}
@@ -616,38 +638,20 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                           <input
                             type="tel"
                             value={phone}
-                            onChange={e => setPhone(e.target.value)}
-                            placeholder="+63 912 345 6789"
+                            onChange={e => setPhone(e.target.value.replace(/\D/g, ''))}
+                            inputMode="numeric"
+                            pattern="[0-9]*"
+                            maxLength={11}
+                            autoComplete="tel"
+                            placeholder="09123456789"
                             style={inputStyle}
                             onFocus={e => { e.currentTarget.style.borderColor = '#7b6a6c'; e.currentTarget.style.boxShadow = '0 0 0 3px rgba(123,106,108,0.12)'; }}
                             onBlur={e => { e.currentTarget.style.borderColor = '#e7e5e4'; e.currentTarget.style.boxShadow = 'none'; }}
                           />
                         </InputField>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-
-                  {/* ── SIGNUP ONLY: Address ── */}
-                  <AnimatePresence>
-                    {mode === 'signup' && (
-                      <motion.div
-                        key="address"
-                        initial={{ opacity: 0, height: 0 }}
-                        animate={{ opacity: 1, height: 'auto' }}
-                        exit={{ opacity: 0, height: 0 }}
-                        style={{ overflow: 'hidden' }}
-                      >
-                        <InputField icon={MapPin} label="Delivery Address">
-                          <input
-                            type="text"
-                            value={address}
-                            onChange={e => setAddress(e.target.value)}
-                            placeholder="123 Brgy. Sample, City"
-                            style={inputStyle}
-                            onFocus={e => { e.currentTarget.style.borderColor = '#7b6a6c'; e.currentTarget.style.boxShadow = '0 0 0 3px rgba(123,106,108,0.12)'; }}
-                            onBlur={e => { e.currentTarget.style.borderColor = '#e7e5e4'; e.currentTarget.style.boxShadow = 'none'; }}
-                          />
-                        </InputField>
+                        <p style={{ fontSize: '0.72rem', color: '#a8a29e', marginTop: '0.35rem', marginLeft: '0.25rem' }}>
+                          Digits only (up to 11 numbers), example: 09123456789
+                        </p>
                       </motion.div>
                     )}
                   </AnimatePresence>
@@ -661,6 +665,7 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                           required
                           value={password}
                           onChange={e => setPassword(e.target.value)}
+                          autoComplete="new-password"
                           placeholder="••••••••"
                           style={inputStyle}
                           onFocus={e => { e.currentTarget.style.borderColor = '#7b6a6c'; e.currentTarget.style.boxShadow = '0 0 0 3px rgba(123,106,108,0.12)'; }}
@@ -669,6 +674,8 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                         <button
                           type="button"
                           onClick={() => setShowPassword(v => !v)}
+                          aria-label={showPassword ? 'Hide password' : 'Show password'}
+                          title={showPassword ? 'Hide password' : 'Show password'}
                           style={{ position: 'absolute', right: '0.875rem', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: '#a8a29e', padding: 0 }}
                         >
                           {showPassword ? <EyeOff style={{ width: '1rem', height: '1rem' }} /> : <Eye style={{ width: '1rem', height: '1rem' }} />}
@@ -762,6 +769,10 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                               value={confirmPassword}
                               onChange={e => setConfirmPassword(e.target.value)}
                               placeholder="••••••••"
+                              autoComplete="new-password"
+                              onCopy={stopClipboardAction}
+                              onCut={stopClipboardAction}
+                              onPaste={stopClipboardAction}
                               style={{
                                 ...inputStyle,
                                 borderColor: confirmPassword
@@ -776,6 +787,8 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                             <button
                               type="button"
                               onClick={() => setShowConfirmPassword(v => !v)}
+                              aria-label={showConfirmPassword ? 'Hide confirm password' : 'Show confirm password'}
+                              title={showConfirmPassword ? 'Hide confirm password' : 'Show confirm password'}
                               style={{ position: 'absolute', right: '0.875rem', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: '#a8a29e', padding: 0 }}
                             >
                               {showConfirmPassword ? <EyeOff style={{ width: '1rem', height: '1rem' }} /> : <Eye style={{ width: '1rem', height: '1rem' }} />}
@@ -816,23 +829,23 @@ export default function LoginModal({ isOpen, onClose }: LoginModalProps) {
                   {/* Submit */}
                   <button
                     type="submit"
-                    disabled={loading || isBanned}
+                    disabled={loading || isBanned || isSignupSubmitDisabled}
                     style={{
                       width: '100%', padding: '0.875rem 1rem',
                       background: mode === 'forgot-password'
                         ? 'linear-gradient(135deg,#3b82f6,#2563eb)'
                         : 'linear-gradient(135deg,#7b6a6c,#9d7e80)',
                       color: '#fff', border: 'none', borderRadius: '14px',
-                      fontWeight: 700, fontSize: '0.95rem', cursor: (loading || isBanned) ? 'not-allowed' : 'pointer',
+                      fontWeight: 700, fontSize: '0.95rem', cursor: (loading || isBanned || isSignupSubmitDisabled) ? 'not-allowed' : 'pointer',
                       display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem',
                       boxShadow: mode === 'forgot-password'
                         ? '0 4px 16px rgba(59,130,246,0.28)'
                         : '0 4px 16px rgba(123,106,108,0.28)',
-                      opacity: (loading || isBanned) ? 0.65 : 1,
+                      opacity: (loading || isBanned || isSignupSubmitDisabled) ? 0.65 : 1,
                       transition: 'opacity 0.2s, transform 0.15s',
                       marginTop: '0.25rem',
                     }}
-                    onMouseEnter={e => { if (!loading && !isBanned) e.currentTarget.style.transform = 'translateY(-1px)'; }}
+                    onMouseEnter={e => { if (!loading && !isBanned && !isSignupSubmitDisabled) e.currentTarget.style.transform = 'translateY(-1px)'; }}
                     onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; }}
                   >
                     {loading ? (

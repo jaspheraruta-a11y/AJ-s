@@ -124,7 +124,7 @@ The main content area switches between three tabs via pill-style tab bar:
   - Collapsed preview: up to 3 item chips.
   - Expandable detail section (Framer Motion height animation):
     - Full item list with sizes, add-ons, notes.
-    - Subtotal / delivery fee / discount / total breakdown.
+    - Subtotal / discount / total breakdown.
     - Customer notes.
 - **Refresh button** + Supabase **real-time subscription** — orders auto-update without page refresh.
 - Filters out `completed` orders (only shows active/recent history, max 30).

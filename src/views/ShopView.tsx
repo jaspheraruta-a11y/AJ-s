@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, Component, ErrorInfo, ReactNode } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, Component, ErrorInfo, ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Coffee, ShoppingCart, User, Menu as MenuIcon, X, Plus, Minus, Trash2, ChevronRight, LogOut, UserCircle, AlertCircle, Gift, Star, ClipboardList, Clock, CheckCircle, ChefHat, XCircle, RefreshCw, Bell } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -46,7 +46,6 @@ interface ClientOrder {
   order_type: string;
   subtotal: number;
   total: number;
-  delivery_fee: number;
   discount_amount: number;
   customer_notes: string | null;
   table_number: string | null;
@@ -130,6 +129,22 @@ const OrderCard = ({ order }: { order: ClientOrder }) => {
   const dateStr = date.toLocaleDateString('en-PH', { month: 'short', day: 'numeric', year: 'numeric' });
   const timeStr = date.toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit' });
   const isActive = order.status === 'preparing' || order.status === 'ready';
+  const getEstimatedTimeText = (status: ClientOrder['status']) => {
+    switch (status) {
+      case 'pending':
+        return 'Estimated: 20-30 mins';
+      case 'confirmed':
+        return 'Estimated: 15-25 mins';
+      case 'preparing':
+        return 'Estimated: 8-15 mins';
+      case 'ready':
+        return 'Ready for pickup';
+      case 'cancelled':
+        return 'Order cancelled';
+      default:
+        return 'Estimated: updating...';
+    }
+  };
 
   return (
     <motion.div
@@ -170,6 +185,16 @@ const OrderCard = ({ order }: { order: ClientOrder }) => {
           <span className="capitalize">{order.order_type} order</span>
           {order.table_number && <span>Table #{order.table_number}</span>}
           <span className="ml-auto font-bold text-[#7b6a6c] text-sm">₱{order.total.toFixed(2)}</span>
+        </div>
+        <div className={`mb-4 text-xs font-semibold px-3 py-2 rounded-xl inline-flex items-center gap-2 ${
+          order.status === 'ready'
+            ? 'bg-green-50 text-green-700 border border-green-100'
+            : order.status === 'cancelled'
+              ? 'bg-red-50 text-red-600 border border-red-100'
+              : 'bg-blue-50 text-blue-700 border border-blue-100'
+        }`}>
+          <Clock className="w-3.5 h-3.5" />
+          {getEstimatedTimeText(order.status)}
         </div>
 
         {/* Items preview (collapsed) */}
@@ -219,12 +244,6 @@ const OrderCard = ({ order }: { order: ClientOrder }) => {
                   <span>Subtotal</span>
                   <span>₱{order.subtotal.toFixed(2)}</span>
                 </div>
-                {order.delivery_fee > 0 && (
-                  <div className="flex justify-between">
-                    <span>Delivery Fee</span>
-                    <span>₱{order.delivery_fee.toFixed(2)}</span>
-                  </div>
-                )}
                 {order.discount_amount > 0 && (
                   <div className="flex justify-between text-green-600">
                     <span>Discount</span>
@@ -264,14 +283,16 @@ const Navbar = ({
   user, 
   onLogin, 
   onLogout,
-  clientPoints
+  clientPoints,
+  cartBounceTrigger
 }: { 
   cartCount: number, 
   onCartClick: () => void,
   user: Profile | null,
   onLogin: () => void,
   onLogout: () => void,
-  clientPoints: number
+  clientPoints: number,
+  cartBounceTrigger: number
 }) => (
   <nav className="fixed top-0 left-0 right-0 z-50 bg-white/80 backdrop-blur-md border-b border-stone-200 px-6 py-4 flex items-center justify-between">
     <div className="flex items-center gap-4">
@@ -292,17 +313,29 @@ const Navbar = ({
     </div>
     
     <div className="flex items-center gap-4">
-      <button 
+      <motion.button 
         onClick={onCartClick}
         className="relative p-2 hover:bg-stone-100 rounded-full transition-colors"
+        animate={
+          cartBounceTrigger > 0
+            ? { scale: [1, 1.16, 0.95, 1], rotate: [0, -6, 6, 0] }
+            : undefined
+        }
+        transition={{ duration: 0.35, ease: 'easeOut' }}
       >
         <ShoppingCart className="w-6 h-6 text-stone-600" />
         {cartCount > 0 && (
-          <span className="absolute top-0 right-0 bg-[#7b6a6c] text-white text-[10px] font-bold w-4 h-4 flex items-center justify-center rounded-full">
+          <motion.span
+            className="absolute top-0 right-0 bg-[#7b6a6c] text-white text-[10px] font-bold w-4 h-4 flex items-center justify-center rounded-full"
+            key={cartBounceTrigger}
+            initial={{ scale: 0.8, y: 0 }}
+            animate={{ scale: [0.8, 1.3, 1], y: [-2, 0] }}
+            transition={{ duration: 0.3, ease: 'easeOut' }}
+          >
             {cartCount}
-          </span>
+          </motion.span>
         )}
-      </button>
+      </motion.button>
       
       {user ? (
         <div className="flex items-center gap-2">
@@ -346,7 +379,17 @@ const CategoryPill = ({ category, isActive, onClick }: { category: Category, isA
   </button>
 );
 
-const ProductCard = ({ product, onAdd, onClick }: { product: Product, onAdd: (p: Product) => void, onClick: (p: Product) => void, key?: string }) => (
+const ProductCard = ({ product, onAdd, onClick }: { product: Product, onAdd: (p: Product) => void, onClick: (p: Product) => void, key?: string }) => {
+  const [isAdding, setIsAdding] = useState(false);
+
+  const handleAdd = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    onAdd(product);
+    setIsAdding(true);
+    window.setTimeout(() => setIsAdding(false), 520);
+  };
+
+  return (
   <motion.div 
     layout
     initial={{ opacity: 0, y: 20 }}
@@ -362,15 +405,39 @@ const ProductCard = ({ product, onAdd, onClick }: { product: Product, onAdd: (p:
         referrerPolicy="no-referrer"
       />
       <div className="absolute top-4 right-4">
-        <button 
-          onClick={(e) => {
-            e.stopPropagation();
-            onAdd(product);
-          }}
-          className="w-10 h-10 bg-white/90 backdrop-blur shadow-lg rounded-full flex items-center justify-center text-[#7b6a6c] hover:bg-[#7b6a6c] hover:text-white transition-all"
+        <motion.button 
+          onClick={handleAdd}
+          aria-label={`Add ${product.name} to cart`}
+          title={`Add ${product.name} to cart`}
+          className="relative w-10 h-10 bg-white/90 backdrop-blur shadow-lg rounded-full flex items-center justify-center text-[#7b6a6c] hover:bg-[#7b6a6c] hover:text-white transition-all overflow-hidden"
+          whileTap={{ scale: 0.88 }}
+          animate={
+            isAdding
+              ? { scale: [1, 1.15, 1], rotate: [0, -10, 10, 0] }
+              : { scale: 1, rotate: 0 }
+          }
+          transition={{ duration: 0.4, ease: 'easeOut' }}
         >
-          <Plus className="w-5 h-5" />
-        </button>
+          <motion.span
+            animate={isAdding ? { y: [-2, -10], opacity: [1, 0] } : { y: 0, opacity: 1 }}
+            transition={{ duration: 0.35, ease: 'easeOut' }}
+          >
+            <Plus className="w-5 h-5" />
+          </motion.span>
+          <AnimatePresence>
+            {isAdding && (
+              <motion.span
+                initial={{ opacity: 0, y: 0, scale: 0.8 }}
+                animate={{ opacity: 1, y: -24, scale: 1 }}
+                exit={{ opacity: 0, y: -32, scale: 0.7 }}
+                transition={{ duration: 0.45, ease: 'easeOut' }}
+                className="absolute -top-2 text-[10px] font-bold text-[#7b6a6c] pointer-events-none"
+              >
+                +1
+              </motion.span>
+            )}
+          </AnimatePresence>
+        </motion.button>
       </div>
     </div>
     <div className="p-5">
@@ -390,7 +457,8 @@ const ProductCard = ({ product, onAdd, onClick }: { product: Product, onAdd: (p:
       </div>
     </div>
   </motion.div>
-);
+  );
+};
 
 // --- Redeemable Product Card ---
 const RedeemableProductCard = ({ item, userPoints }: { item: RedeemableProduct, userPoints: number }) => {
@@ -403,10 +471,10 @@ const RedeemableProductCard = ({ item, userPoints }: { item: RedeemableProduct, 
       layout
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      className={`group bg-white rounded-3xl border overflow-hidden transition-all duration-300 ${
+      className={`group rounded-3xl border overflow-hidden transition-all duration-300 ${
         canRedeem
-          ? 'border-amber-200 hover:shadow-xl hover:shadow-amber-100 cursor-pointer'
-          : 'border-stone-100 opacity-70'
+          ? 'bg-white border-amber-200 hover:shadow-xl hover:shadow-amber-100 cursor-pointer'
+          : 'bg-stone-200 border-stone-300 opacity-90 grayscale-[0.15]'
       }`}
     >
       <div className="aspect-square overflow-hidden bg-gradient-to-br from-amber-50 to-stone-100 relative">
@@ -422,13 +490,6 @@ const RedeemableProductCard = ({ item, userPoints }: { item: RedeemableProduct, 
             <Gift className="w-20 h-20 text-amber-200" />
           </div>
         )}
-        {/* Points badge */}
-        <div className="absolute top-4 left-4">
-          <div className="flex items-center gap-1 bg-amber-500 text-white text-xs font-bold px-3 py-1.5 rounded-full shadow-lg">
-            <Star className="w-3 h-3 fill-white" />
-            {item.points_required} pts
-          </div>
-        </div>
         {/* Status badge */}
         {(isOutOfStock || isExpired) && (
           <div className="absolute inset-0 bg-black/40 flex items-center justify-center">
@@ -503,7 +564,7 @@ const CartDrawer = ({
         >
           <div className="p-6 border-b border-stone-200 flex items-center justify-between bg-white">
             <h2 className="font-serif text-2xl font-bold text-[#7b6a6c]">Your Order</h2>
-            <button onClick={onClose} className="p-2 hover:bg-stone-100 rounded-full">
+            <button onClick={onClose} aria-label="Close cart" title="Close cart" className="p-2 hover:bg-stone-100 rounded-full">
               <X className="w-6 h-6 text-stone-500" />
             </button>
           </div>
@@ -541,6 +602,8 @@ const CartDrawer = ({
                       <h4 className="font-serif font-bold text-[#7b6a6c] truncate">{item.name}</h4>
                       <button 
                         onClick={() => onRemove(item.id, item.selectedSize?.id)}
+                        aria-label={`Remove ${item.name} from cart`}
+                        title={`Remove ${item.name} from cart`}
                         className="text-stone-300 hover:text-red-500 transition-colors"
                       >
                         <Trash2 className="w-4 h-4" />
@@ -556,6 +619,8 @@ const CartDrawer = ({
                       <div className="flex items-center gap-3 bg-white border border-stone-200 rounded-full px-2 py-1">
                         <button 
                           onClick={() => onUpdateQuantity(item.id, item.quantity - 1, item.selectedSize?.id)}
+                          aria-label={`Decrease ${item.name} quantity`}
+                          title={`Decrease ${item.name} quantity`}
                           className="p-1 hover:bg-stone-50 rounded-full"
                         >
                           <Minus className="w-3 h-3 text-stone-600" />
@@ -563,6 +628,8 @@ const CartDrawer = ({
                         <span className="text-sm font-bold text-[#7b6a6c] w-4 text-center">{item.quantity}</span>
                         <button 
                           onClick={() => onUpdateQuantity(item.id, item.quantity + 1, item.selectedSize?.id)}
+                          aria-label={`Increase ${item.name} quantity`}
+                          title={`Increase ${item.name} quantity`}
                           className="p-1 hover:bg-stone-50 rounded-full"
                         >
                           <Plus className="w-3 h-3 text-stone-600" />
@@ -717,6 +784,35 @@ export default function ShopView() {
   // --- Orders state ---
   const [clientOrders, setClientOrders] = useState<ClientOrder[]>([]);
   const [ordersLoading, setOrdersLoading] = useState(false);
+  const [suggestedProducts, setSuggestedProducts] = useState<Product[]>([]);
+  const [isAddonsModalOpen, setIsAddonsModalOpen] = useState(false);
+  const [checkoutIntent, setCheckoutIntent] = useState<{ cart: CartItem[]; total: number } | null>(null);
+  const [cartBounceTrigger, setCartBounceTrigger] = useState(0);
+
+  const productsByCategory = useMemo(() => {
+    const grouped = new Map<string, Product[]>();
+    products.forEach((product) => {
+      const existing = grouped.get(product.category_id) || [];
+      existing.push(product);
+      grouped.set(product.category_id, existing);
+    });
+    return grouped;
+  }, [products]);
+
+  const menuCategorySections = useMemo(() => {
+    if (selectedCategory) {
+      const category = categories.find(cat => cat.id === selectedCategory);
+      if (!category) return [];
+      return [{ category, items: productsByCategory.get(category.id) || [] }];
+    }
+
+    return categories
+      .map(category => ({
+        category,
+        items: productsByCategory.get(category.id) || []
+      }))
+      .filter(section => section.items.length > 0);
+  }, [categories, productsByCategory, selectedCategory]);
 
   const fetchRedeemableProducts = async () => {
     setRedeemLoading(true);
@@ -923,6 +1019,12 @@ export default function ShopView() {
   const handleProductClick = (product: Product) => {
     setSelectedProduct(product);
     setIsProductModalOpen(true);
+    const productCategoryItems = products.filter(p => p.category_id === product.category_id && p.id !== product.id);
+    const fallbackItems = products.filter(p => p.id !== product.id && p.has_addons === product.has_addons);
+    const partnerCandidates = [...productCategoryItems, ...fallbackItems]
+      .filter((candidate, index, arr) => arr.findIndex(x => x.id === candidate.id) === index)
+      .slice(0, 6);
+    setSuggestedProducts(partnerCandidates);
     
     if (product.has_sizes) {
       fetchProductSizes(product.id);
@@ -935,12 +1037,45 @@ export default function ShopView() {
     setIsProductModalOpen(false);
     setSelectedProduct(null);
     setProductSizes([]);
+    setSuggestedProducts([]);
   };
 
   const handleAddToCartFromModal = (product: Product, size?: ProductSize) => {
     addToCart(product, size);
+    setCartBounceTrigger(v => v + 1);
     closeProductModal();
-    setIsCartOpen(true);
+  };
+
+  const handleQuickAddToCart = (product: Product) => {
+    addToCart(product);
+    setCartBounceTrigger(v => v + 1);
+  };
+
+  const buildAddonRecommendations = useCallback((sourceCart: CartItem[]) => {
+    if (sourceCart.length === 0) return [];
+    const categoryIds = new Set(sourceCart.map(item => item.category_id));
+    const cartProductIds = new Set(sourceCart.map(item => item.id));
+    return products
+      .filter(product => !cartProductIds.has(product.id) && categoryIds.has(product.category_id))
+      .slice(0, 8);
+  }, [products]);
+
+  const handleCheckout = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) {
+      setIsLoginModalOpen(true);
+      return;
+    }
+
+    const payload = { cart, total: totalAmount };
+    setCheckoutIntent(payload);
+    setIsAddonsModalOpen(true);
+  };
+
+  const continueToCheckout = (payload: { cart: CartItem[]; total: number }) => {
+    setIsAddonsModalOpen(false);
+    setIsCartOpen(false);
+    navigate('/payment', { state: { cart: payload.cart, total: payload.total } });
   };
 
   if (shopLoading || authLoading) {
@@ -1016,6 +1151,8 @@ export default function ShopView() {
               </div>
               <button
                 onClick={() => dismissClientNotif(notif.key)}
+                aria-label="Dismiss order ready notification"
+                title="Dismiss notification"
                 className="p-1 hover:bg-stone-100 rounded-lg transition-colors text-stone-400 hover:text-stone-600 flex-shrink-0"
               >
                 <X className="w-4 h-4" />
@@ -1031,6 +1168,7 @@ export default function ShopView() {
           onLogin={() => setIsLoginModalOpen(true)}
           onLogout={handleLogout}
           clientPoints={clientPoints}
+          cartBounceTrigger={cartBounceTrigger}
         />
       
       <main className="pt-28 pb-20 px-6 max-w-7xl mx-auto">
@@ -1136,20 +1274,22 @@ export default function ShopView() {
 
           {/* Category filter — only shown on menu tab */}
           {activeTab === 'menu' && (
-            <div className="flex gap-3 overflow-x-auto pb-4 no-scrollbar">
-              <CategoryPill 
-                category={{ id: '', name: 'All Items', slug: 'all', sort_order: 0 }}
-                isActive={selectedCategory === null}
-                onClick={() => setSelectedCategory(null)}
-              />
-              {categories.map(cat => (
+            <div className="sticky top-24 z-40 bg-stone-50/95 backdrop-blur-sm rounded-2xl border border-stone-100 px-3 pt-3">
+              <div className="flex gap-3 overflow-x-auto pb-3 no-scrollbar">
                 <CategoryPill 
-                  key={cat.id}
-                  category={cat}
-                  isActive={selectedCategory === cat.id}
-                  onClick={() => setSelectedCategory(cat.id)}
+                  category={{ id: '', name: 'All Items', slug: 'all', sort_order: 0 }}
+                  isActive={selectedCategory === null}
+                  onClick={() => setSelectedCategory(null)}
                 />
-              ))}
+                {categories.map(cat => (
+                  <CategoryPill 
+                    key={cat.id}
+                    category={cat}
+                    isActive={selectedCategory === cat.id}
+                    onClick={() => setSelectedCategory(cat.id)}
+                  />
+                ))}
+              </div>
             </div>
           )}
 
@@ -1178,20 +1318,29 @@ export default function ShopView() {
         {/* Menu Products Grid */}
         {activeTab === 'menu' && (
           <>
-            <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
-              <AnimatePresence mode="popLayout">
-                {products.map(product => (
-                  <ProductCard 
-                    key={product.id} 
-                    product={product} 
-                    onAdd={(p) => {
-                      addToCart(p);
-                      setIsCartOpen(true);
-                    }}
-                    onClick={handleProductClick}
-                  />
-                ))}
-              </AnimatePresence>
+            <section className="space-y-12">
+              {menuCategorySections.map(section => (
+                <div key={section.category.id}>
+                  <div className="flex items-center gap-3 mb-6">
+                    <h3 className="font-serif text-2xl font-bold text-[#7b6a6c]">{section.category.name}</h3>
+                    <span className="text-xs text-stone-400 font-semibold uppercase tracking-wider">
+                      {section.items.length} item{section.items.length > 1 ? 's' : ''}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
+                    <AnimatePresence mode="popLayout">
+                      {section.items.map(product => (
+                        <ProductCard 
+                          key={product.id} 
+                          product={product} 
+                          onAdd={handleQuickAddToCart}
+                          onClick={handleProductClick}
+                        />
+                      ))}
+                    </AnimatePresence>
+                  </div>
+                </div>
+              ))}
             </section>
             {products.length === 0 && (
               <div className="py-20 text-center">
@@ -1339,16 +1488,7 @@ export default function ShopView() {
             onUpdateQuantity={updateQuantity}
             onRemove={removeFromCart}
             total={totalAmount}
-            onCheckout={async () => {
-              const { data: { session } } = await supabase.auth.getSession();
-              if (session) {
-                setIsCartOpen(false);
-                navigate('/payment', { state: { cart, total: totalAmount } });
-              } else {
-                setIsCartOpen(false);
-                setIsLoginModalOpen(true);
-              }
-            }}
+            onCheckout={handleCheckout}
           />
         )}
         <LoginModal 
@@ -1358,10 +1498,60 @@ export default function ShopView() {
         <ProductModal
           product={selectedProduct}
           sizes={productSizes}
+          suggestedProducts={suggestedProducts}
           isOpen={isProductModalOpen}
           onClose={closeProductModal}
           onAddToCart={handleAddToCartFromModal}
         />
+        {isAddonsModalOpen && checkoutIntent && (
+          <>
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[95]"
+            />
+            <motion.div
+              initial={{ opacity: 0, y: 20, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 20, scale: 0.98 }}
+              className="fixed inset-x-0 top-1/2 -translate-y-1/2 mx-auto w-[95%] max-w-3xl bg-white rounded-3xl border border-stone-200 shadow-2xl z-[100] p-6"
+            >
+              <div className="mb-4">
+                <p className="text-xs uppercase tracking-wider text-stone-400 font-semibold">Add-ons</p>
+                <h3 className="font-serif text-2xl font-bold text-[#7b6a6c]">Would you like to add more items?</h3>
+                <p className="text-sm text-stone-500 mt-1">Recommended products before checkout.</p>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[42vh] overflow-y-auto pr-1">
+                {buildAddonRecommendations(checkoutIntent.cart).map(item => (
+                  <button
+                    key={item.id}
+                    onClick={() => handleQuickAddToCart(item)}
+                    className="text-left border border-stone-200 rounded-2xl p-3 hover:border-[#7b6a6c] hover:bg-stone-50 transition-colors"
+                  >
+                    <p className="font-semibold text-[#7b6a6c] text-sm line-clamp-1">{item.name}</p>
+                    <p className="text-xs text-stone-500 line-clamp-2 mt-1">{item.description || 'Popular add-on for this order.'}</p>
+                    <p className="text-xs font-bold text-[#7b6a6c] mt-2">₱{item.price.toFixed(2)} · Add to cart</p>
+                  </button>
+                ))}
+              </div>
+              <div className="flex flex-wrap gap-3 justify-end mt-5">
+                <button
+                  onClick={() => continueToCheckout(checkoutIntent)}
+                  className="px-5 py-2.5 rounded-full border border-stone-200 text-stone-600 hover:border-stone-400 transition-colors font-semibold"
+                >
+                  NOT NOW
+                </button>
+                <button
+                  onClick={() => continueToCheckout({ cart, total: totalAmount })}
+                  className="px-5 py-2.5 rounded-full bg-[#7b6a6c] text-white font-semibold hover:bg-[#6b5b5d] transition-colors"
+                >
+                  Continue Checkout
+                </button>
+              </div>
+            </motion.div>
+          </>
+        )}
       </AnimatePresence>
 
       {/* Footer */}

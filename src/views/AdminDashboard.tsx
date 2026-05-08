@@ -1,11 +1,11 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   BarChart3, 
   Users, 
   ShoppingBag, 
   Package, 
-  DollarSign, 
+  PhilippinePeso,
   TrendingUp,
   Clock,
   CheckCircle,
@@ -45,6 +45,7 @@ import {
   History,
   KeyRound,
   CreditCard,
+  FileSpreadsheet,
 } from 'lucide-react';
 import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { useStaffPermissions, useStatusChangeCooldown, TabId } from '../contexts/StaffPermissionsContext';
@@ -99,7 +100,7 @@ function statusCellClass(status: string): string {
   return 'status-pill status-progress';
 }
 
-const exportOrdersToPDF = (orders: Order[], customers: Profile[], generatedBy: Profile) => {
+const exportOrdersToPDF = async (orders: Order[], customers: Profile[], generatedBy: Profile) => {
   const reportId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `RPT-${Date.now()}`;
   const generatedAt = new Date();
   const generatedAtStr = generatedAt.toLocaleString();
@@ -125,6 +126,34 @@ const exportOrdersToPDF = (orders: Order[], customers: Profile[], generatedBy: P
   ].join('\n');
   const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=140x140&data=${encodeURIComponent(verificationPayload)}`;
 
+  let orderItemsByOrderId: Record<string, Array<{
+    product_name: string;
+    size?: string | null;
+    quantity: number;
+    unit_price: number;
+    line_total: number;
+  }>> = {};
+
+  if (orders.length > 0) {
+    try {
+      const { supabase } = await import('../supabase');
+      const orderIds = orders.map((o) => o.id);
+      const { data: orderItemsData, error: itemsError } = await supabase
+        .from('order_items')
+        .select('order_id, product_name, size, quantity, unit_price, line_total')
+        .in('order_id', orderIds);
+      if (!itemsError && orderItemsData) {
+        orderItemsByOrderId = orderItemsData.reduce((acc: Record<string, any[]>, item: any) => {
+          if (!acc[item.order_id]) acc[item.order_id] = [];
+          acc[item.order_id].push(item);
+          return acc;
+        }, {});
+      }
+    } catch (error) {
+      console.warn('Unable to include order items in PDF export:', error);
+    }
+  }
+
   const rows = orders
     .map((order) => {
       const cust = customers.find((u) => u.id === order.user_id);
@@ -132,12 +161,23 @@ const exportOrdersToPDF = (orders: Order[], customers: Profile[], generatedBy: P
       const total = Number(order.total || 0).toFixed(2);
       const status = escapeHtmlPdf(order.status);
       const statusClass = statusCellClass(order.status);
+      const itemRows = (orderItemsByOrderId[order.id] || [])
+        .map((item) => {
+          const sizeLabel = item.size ? ` (${escapeHtmlPdf(item.size)})` : '';
+          return `<div style="padding:2px 0;">
+            <span class="strong">${escapeHtmlPdf(item.product_name)}${sizeLabel}</span>
+            <span style="color:#57534e;"> · Qty ${item.quantity} · ₱${Number(item.unit_price || 0).toFixed(2)} = ₱${Number(item.line_total || 0).toFixed(2)}</span>
+          </div>`;
+        })
+        .join('');
+      const itemCell = itemRows || '<span style="color:#78716c;">No item details</span>';
       return `
       <tr>
         <td class="mono">${escapeHtmlPdf(order.order_number)}</td>
         <td>${escapeHtmlPdf(new Date(order.created_at).toLocaleString())}</td>
         <td>${customer}</td>
         <td>${formatOrderTypeLabel(order.order_type)}</td>
+        <td>${itemCell}</td>
         <td class="num strong">&#8369;${total}</td>
         <td><span class="${statusClass}">${status}</span></td>
       </tr>`;
@@ -413,14 +453,15 @@ const exportOrdersToPDF = (orders: Order[], customers: Profile[], generatedBy: P
           <th>Date &amp; time</th>
           <th>Customer</th>
           <th>Type</th>
+          <th>Items</th>
           <th class="num">Total</th>
           <th>Status</th>
         </tr>
       </thead>
-      <tbody>${rows || `<tr><td colspan="6" style="text-align:center;padding:20px;color:#78716c;">No orders in this report.</td></tr>`}</tbody>
+      <tbody>${rows || `<tr><td colspan="7" style="text-align:center;padding:20px;color:#78716c;">No orders in this report.</td></tr>`}</tbody>
       <tfoot>
         <tr>
-          <td colspan="4">Subtotal of all order totals (all statuses)</td>
+          <td colspan="5">Subtotal of all order totals (all statuses)</td>
           <td class="num strong">&#8369;${sumAllTotals.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
           <td></td>
         </tr>
@@ -536,6 +577,14 @@ type CounterOrderSnapshot = {
   }[];
 };
 
+type DashboardNotification = {
+  id: string;
+  title: string;
+  message: string;
+  tone: 'info' | 'success' | 'warning';
+  timeLabel: string;
+};
+
 const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 'admin' }) => {
   const isStaff = mode === 'staff';
   const navigate = useNavigate();
@@ -547,10 +596,37 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
   const [inventorySearchTerm, setInventorySearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [productCategoryFilter, setProductCategoryFilter] = useState<string>('all');
+  const [productSearchTerm, setProductSearchTerm] = useState('');
   const [inventoryCategoryFilter, setInventoryCategoryFilter] = useState<string>('all');
   const [inventoryFilters, setInventoryFilters] = useState({ lowStock: false, optimal: false });
   const [ordersPage, setOrdersPage] = useState(1);
+  const [productsPage, setProductsPage] = useState(1);
+  const [usersPage, setUsersPage] = useState(1);
   const [inventoryPage, setInventoryPage] = useState(1);
+  const [promosPage, setPromosPage] = useState(1);
+  const [activitiesPage, setActivitiesPage] = useState(1);
+  const [loginLogsPage, setLoginLogsPage] = useState(1);
+  const [userSearchTerm, setUserSearchTerm] = useState('');
+  const [userRoleFilter, setUserRoleFilter] = useState<'all' | 'admin' | 'staff' | 'client'>('all');
+  const [promoSearchTerm, setPromoSearchTerm] = useState('');
+  const [promoStatusFilter, setPromoStatusFilter] = useState<'all' | 'active' | 'inactive'>('all');
+  const [activitySearchTerm, setActivitySearchTerm] = useState('');
+  const [loginSearchTerm, setLoginSearchTerm] = useState('');
+  const [loginMethodFilter, setLoginMethodFilter] = useState<'all' | 'email' | 'google' | 'github' | 'apple'>('all');
+  const [analyticsPeriod, setAnalyticsPeriod] = useState<'daily' | 'weekly' | 'monthly' | 'yearly'>('monthly');
+  const [exportStatusFilter, setExportStatusFilter] = useState<'all' | Order['status']>('all');
+  const [analyticsDayFilter, setAnalyticsDayFilter] = useState(new Date().toISOString().slice(0, 10));
+  const [analyticsMonthFilter, setAnalyticsMonthFilter] = useState(`${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`);
+  const [analyticsYearFilter, setAnalyticsYearFilter] = useState(String(new Date().getFullYear()));
+  const [analyticsWeekFilter, setAnalyticsWeekFilter] = useState(() => {
+    const now = new Date();
+    const temp = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+    const dayNum = temp.getUTCDay() || 7;
+    temp.setUTCDate(temp.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(temp.getUTCFullYear(), 0, 1));
+    const weekNo = Math.ceil((((temp.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+    return `${temp.getUTCFullYear()}-W${String(weekNo).padStart(2, '0')}`;
+  });
 
   const TABLE_PAGE_SIZE = 10;
 
@@ -587,6 +663,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
   const [readyNotifications, setReadyNotifications] = useState<{ id: string; orderNumber: string; key: number }[]>([]);
   const prevOrderStatusesRef = useRef<Record<string, string>>({});
   const notifKeyRef = useRef(0);
+  const [showNotificationMenu, setShowNotificationMenu] = useState(false);
+  const notificationMenuRef = useRef<HTMLDivElement | null>(null);
   const dismissNotification = useCallback((key: number) => {
     setReadyNotifications(prev => prev.filter(n => n.key !== key));
   }, []);
@@ -613,6 +691,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     products, 
     categories,
     users, 
+    payments,
     inventory, 
     promos, 
     adminLogs,
@@ -627,7 +706,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     updateInventory 
   } = useAdminController();
 
-  const { orderItems, getOrderItems } = useOrderManagement();
+  const { orderItems, loading: orderItemsLoading, getOrderItems } = useOrderManagement();
 
   // Detect orders that just became "ready" and show toast notification
   useEffect(() => {
@@ -660,6 +739,86 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     const timer = setTimeout(() => dismissNotification(latest.key), 8000);
     return () => clearTimeout(timer);
   }, [readyNotifications, dismissNotification]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (!notificationMenuRef.current) return;
+      if (!notificationMenuRef.current.contains(event.target as Node)) {
+        setShowNotificationMenu(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const dashboardNotifications = useMemo<DashboardNotification[]>(() => {
+    const readyCount = orders.filter((order) => order.status === 'ready').length;
+    const pendingCount = orders.filter((order) => order.status === 'pending' || order.status === 'preparing').length;
+    const lowStockCount = inventory.filter((item) => item.quantity <= item.low_stock_threshold).length;
+    const activePromoCount = promos.filter((promo) => promo.is_active).length;
+
+    const dynamicReady = readyNotifications
+      .slice(-5)
+      .reverse()
+      .map((notif) => ({
+        id: `ready-${notif.key}`,
+        title: 'Order Ready',
+        message: `${notif.orderNumber} is now ready for pickup.`,
+        tone: 'success' as const,
+        timeLabel: 'Just now',
+      }));
+
+    const suggested: DashboardNotification[] = [
+      {
+        id: 'pending-workflow',
+        title: pendingCount > 0 ? 'Orders Need Attention' : 'Orders Queue Stable',
+        message: pendingCount > 0
+          ? `${pendingCount} order${pendingCount > 1 ? 's are' : ' is'} waiting in pending/preparing.`
+          : 'No pending or preparing orders right now.',
+        tone: pendingCount > 0 ? 'warning' : 'info',
+        timeLabel: 'Live',
+      },
+      {
+        id: 'ready-pickup',
+        title: 'Pickup Watch',
+        message: readyCount > 0
+          ? `${readyCount} order${readyCount > 1 ? 's are' : ' is'} ready for pickup.`
+          : 'No orders waiting for pickup at the moment.',
+        tone: readyCount > 0 ? 'success' : 'info',
+        timeLabel: 'Live',
+      },
+      {
+        id: 'inventory-alert',
+        title: lowStockCount > 0 ? 'Low Stock Alert' : 'Inventory Healthy',
+        message: lowStockCount > 0
+          ? `${lowStockCount} item${lowStockCount > 1 ? 's are' : ' is'} below threshold.`
+          : 'All tracked items are above low-stock threshold.',
+        tone: lowStockCount > 0 ? 'warning' : 'info',
+        timeLabel: 'Live',
+      },
+      {
+        id: 'promo-status',
+        title: 'Promo Snapshot',
+        message: activePromoCount > 0
+          ? `${activePromoCount} active promo${activePromoCount > 1 ? 's are' : ' is'} currently running.`
+          : 'No active promos. Consider launching a limited-time offer.',
+        tone: 'info',
+        timeLabel: 'Today',
+      },
+      {
+        id: 'role-tip',
+        title: isStaff ? 'Staff Reminder' : 'Admin Reminder',
+        message: isStaff
+          ? 'Use the Orders tab first during peak hours to keep queue times low.'
+          : 'Review staff restrictions weekly to match current workflow needs.',
+        tone: 'info',
+        timeLabel: 'Tip',
+      },
+    ];
+
+    return [...dynamicReady, ...suggested].slice(0, 5);
+  }, [orders, inventory, promos, readyNotifications, isStaff]);
 
   // ── Add Product handler ─────────────────────────────────────────────────────
   const handleAddProduct = async (e: React.FormEvent) => {
@@ -1230,7 +1389,9 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
   });
 
   const filteredProducts = products.filter(product => {
-    return productCategoryFilter === 'all' || product.category_id === productCategoryFilter;
+    const matchesCategory = productCategoryFilter === 'all' || product.category_id === productCategoryFilter;
+    const matchesSearch = productSearchTerm.trim() === '' || product.name.toLowerCase().includes(productSearchTerm.toLowerCase());
+    return matchesCategory && matchesSearch;
   });
 
   const filteredInventory = inventory.filter(item => {
@@ -1251,8 +1412,58 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     return matchesCategory && matchesSearch && matchesStatus;
   });
 
+  const filteredUsers = users.filter(u => {
+    const q = userSearchTerm.toLowerCase();
+    const roleMatch = userRoleFilter === 'all' || u.role === userRoleFilter;
+    const searchMatch = q === '' || (u.full_name || '').toLowerCase().includes(q) || (u.email || '').toLowerCase().includes(q);
+    return roleMatch && searchMatch;
+  });
+
+  const filteredPromos = promos.filter((promo) => {
+    const q = promoSearchTerm.toLowerCase();
+    const matchesSearch =
+      q === '' ||
+      promo.product_name.toLowerCase().includes(q) ||
+      (promo.description || '').toLowerCase().includes(q);
+    const matchesStatus =
+      promoStatusFilter === 'all' ||
+      (promoStatusFilter === 'active' && promo.is_active) ||
+      (promoStatusFilter === 'inactive' && !promo.is_active);
+    return matchesSearch && matchesStatus;
+  });
+
+  const filteredActivities = adminLogs.filter((log) => {
+    const q = activitySearchTerm.toLowerCase();
+    if (q === '') return true;
+    const actor = users.find(u => u.id === log.user_id);
+    const actorName = actor?.full_name || actor?.email || 'Unknown user';
+    return (
+      summarizeAdminActivity(log).toLowerCase().includes(q) ||
+      actorName.toLowerCase().includes(q) ||
+      (log.entity_type || '').toLowerCase().includes(q)
+    );
+  });
+
+  const filteredLoginLogs = loginLogs.filter((row) => {
+    const q = loginSearchTerm.toLowerCase();
+    const p = users.find(u => u.id === row.user_id);
+    const matchesSearch =
+      q === '' ||
+      (p?.full_name || '').toLowerCase().includes(q) ||
+      (p?.email || '').toLowerCase().includes(q) ||
+      formatLoginMethod(row.method).toLowerCase().includes(q);
+    const normalizedMethod = (row.method || '').toLowerCase();
+    const matchesMethod = loginMethodFilter === 'all' || normalizedMethod === loginMethodFilter;
+    return matchesSearch && matchesMethod;
+  });
+
   const ordersTotalPages = Math.max(1, Math.ceil(filteredOrders.length / TABLE_PAGE_SIZE));
+  const productsTotalPages = Math.max(1, Math.ceil(filteredProducts.length / TABLE_PAGE_SIZE));
+  const usersTotalPages = Math.max(1, Math.ceil(filteredUsers.length / TABLE_PAGE_SIZE));
   const inventoryTotalPages = Math.max(1, Math.ceil(filteredInventory.length / TABLE_PAGE_SIZE));
+  const promosTotalPages = Math.max(1, Math.ceil(filteredPromos.length / TABLE_PAGE_SIZE));
+  const activitiesTotalPages = Math.max(1, Math.ceil(filteredActivities.length / TABLE_PAGE_SIZE));
+  const loginLogsTotalPages = Math.max(1, Math.ceil(filteredLoginLogs.length / TABLE_PAGE_SIZE));
 
   useEffect(() => {
     setOrdersPage(1);
@@ -1270,6 +1481,37 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     setInventoryPage(p => Math.min(p, inventoryTotalPages));
   }, [inventoryTotalPages]);
 
+  useEffect(() => {
+    setProductsPage(1);
+  }, [productSearchTerm, productCategoryFilter]);
+  useEffect(() => {
+    setProductsPage(p => Math.min(p, productsTotalPages));
+  }, [productsTotalPages]);
+  useEffect(() => {
+    setUsersPage(1);
+  }, [userSearchTerm, userRoleFilter]);
+  useEffect(() => {
+    setUsersPage(p => Math.min(p, usersTotalPages));
+  }, [usersTotalPages]);
+  useEffect(() => {
+    setPromosPage(1);
+  }, [promoSearchTerm, promoStatusFilter]);
+  useEffect(() => {
+    setPromosPage(p => Math.min(p, promosTotalPages));
+  }, [promosTotalPages]);
+  useEffect(() => {
+    setActivitiesPage(1);
+  }, [activitySearchTerm]);
+  useEffect(() => {
+    setActivitiesPage(p => Math.min(p, activitiesTotalPages));
+  }, [activitiesTotalPages]);
+  useEffect(() => {
+    setLoginLogsPage(1);
+  }, [loginSearchTerm, loginMethodFilter]);
+  useEffect(() => {
+    setLoginLogsPage(p => Math.min(p, loginLogsTotalPages));
+  }, [loginLogsTotalPages]);
+
   const pagedOrders = filteredOrders.slice(
     (ordersPage - 1) * TABLE_PAGE_SIZE,
     ordersPage * TABLE_PAGE_SIZE
@@ -1278,6 +1520,55 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     (inventoryPage - 1) * TABLE_PAGE_SIZE,
     inventoryPage * TABLE_PAGE_SIZE
   );
+  const pagedProducts = filteredProducts.slice((productsPage - 1) * TABLE_PAGE_SIZE, productsPage * TABLE_PAGE_SIZE);
+  const pagedUsers = filteredUsers.slice((usersPage - 1) * TABLE_PAGE_SIZE, usersPage * TABLE_PAGE_SIZE);
+  const pagedPromos = filteredPromos.slice((promosPage - 1) * TABLE_PAGE_SIZE, promosPage * TABLE_PAGE_SIZE);
+  const pagedActivities = filteredActivities.slice((activitiesPage - 1) * TABLE_PAGE_SIZE, activitiesPage * TABLE_PAGE_SIZE);
+  const pagedLoginLogs = filteredLoginLogs.slice((loginLogsPage - 1) * TABLE_PAGE_SIZE, loginLogsPage * TABLE_PAGE_SIZE);
+
+  const paymentByOrderId = payments.reduce<Record<string, typeof payments[number]>>((acc, payment) => {
+    const existing = acc[payment.order_id];
+    if (!existing || new Date(payment.created_at).getTime() > new Date(existing.created_at).getTime()) {
+      acc[payment.order_id] = payment;
+    }
+    return acc;
+  }, {});
+
+  const analyticsScopedOrders = (() => {
+    const selectedYear = parseInt(analyticsYearFilter, 10);
+    const [selectedMonthYear, selectedMonthIndex] = analyticsMonthFilter.split('-').map((v) => parseInt(v, 10));
+    const selectedDay = analyticsDayFilter;
+    const getWeekRange = (weekValue: string) => {
+      const [yPart, wPart] = weekValue.split('-W');
+      const year = parseInt(yPart, 10);
+      const week = parseInt(wPart, 10);
+      const start = new Date(Date.UTC(year, 0, 1 + (week - 1) * 7));
+      const day = start.getUTCDay() || 7;
+      if (day !== 1) start.setUTCDate(start.getUTCDate() + (1 - day));
+      const end = new Date(start);
+      end.setUTCDate(start.getUTCDate() + 7);
+      return { start, end };
+    };
+
+    return orders.filter((order) => {
+      const d = new Date(order.created_at);
+      if (analyticsPeriod === 'daily') {
+        return d.toISOString().slice(0, 10) === selectedDay;
+      }
+      if (analyticsPeriod === 'weekly') {
+        const { start, end } = getWeekRange(analyticsWeekFilter);
+        return d >= start && d < end;
+      }
+      if (analyticsPeriod === 'monthly') {
+        return d.getFullYear() === selectedMonthYear && (d.getMonth() + 1) === selectedMonthIndex;
+      }
+      return !Number.isNaN(selectedYear) && d.getFullYear() === selectedYear;
+    });
+  })();
+  const exportReadyOrders = (sourceOrders: Order[]) => {
+    if (exportStatusFilter === 'all') return sourceOrders;
+    return sourceOrders.filter((order) => order.status === exportStatusFilter);
+  };
 
   const StatCard = ({ title, value, icon: Icon, trend, color = 'blue' }: any) => (
     <motion.div 
@@ -1317,7 +1608,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
         <StatCard 
           title="Today's Revenue" 
           value={`₱${stats.todayRevenue.toFixed(2)}`} 
-          icon={DollarSign} 
+          icon={PhilippinePeso} 
           color="green"
           trend={8}
         />
@@ -1350,7 +1641,20 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
         </div>
         <div className="divide-y divide-stone-100">
           {orders.slice(0, 5).map((order) => (
-            <div key={order.id} className="p-4 hover:bg-stone-50 transition-colors">
+            <div
+              key={order.id}
+              role="button"
+              tabIndex={0}
+              onClick={() => handleOrderClick(order)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  void handleOrderClick(order);
+                }
+              }}
+              className="p-4 hover:bg-stone-50 transition-colors cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-[#7b6a6c] focus-visible:ring-offset-2"
+              aria-label={`View details for order ${order.order_number}`}
+            >
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-4">
                   <div className="w-10 h-10 bg-stone-100 rounded-xl flex items-center justify-center">
@@ -1378,7 +1682,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
 
       {/* Quick Actions */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <button className="p-6 bg-white rounded-2xl border border-stone-100 hover:shadow-lg transition-all text-left">
+        <button onClick={() => setActiveTab('products')} className="p-6 bg-white rounded-2xl border border-stone-100 hover:shadow-lg transition-all text-left">
           <div className="w-12 h-12 bg-blue-50 rounded-xl flex items-center justify-center text-blue-600 mb-4">
             <Package className="w-6 h-6" />
           </div>
@@ -1386,7 +1690,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
           <p className="text-sm text-stone-500">Update product availability and pricing</p>
         </button>
         
-        <button className="p-6 bg-white rounded-2xl border border-stone-100 hover:shadow-lg transition-all text-left">
+        <button onClick={() => setActiveTab('promos')} className="p-6 bg-white rounded-2xl border border-stone-100 hover:shadow-lg transition-all text-left">
           <div className="w-12 h-12 bg-green-50 rounded-xl flex items-center justify-center text-green-600 mb-4">
             <Target className="w-6 h-6" />
           </div>
@@ -1394,7 +1698,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
           <p className="text-sm text-stone-500">Set up discounts and special offers</p>
         </button>
         
-        <button className="p-6 bg-white rounded-2xl border border-stone-100 hover:shadow-lg transition-all text-left">
+        <button onClick={() => setActiveTab('analytics')} className="p-6 bg-white rounded-2xl border border-stone-100 hover:shadow-lg transition-all text-left">
           <div className="w-12 h-12 bg-purple-50 rounded-xl flex items-center justify-center text-purple-600 mb-4">
             <BarChart3 className="w-6 h-6" />
           </div>
@@ -1439,13 +1743,27 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
       <div className="bg-white rounded-2xl border border-stone-100 overflow-hidden">
         <div className="p-6 border-b border-stone-100 flex items-center justify-between">
           <h3 className="text-lg font-bold text-stone-800">Orders ({filteredOrders.length})</h3>
-          <button
-            onClick={() => exportOrdersToPDF(filteredOrders, users, user)}
-            className="flex items-center gap-2 px-4 py-2 text-sm text-stone-600 hover:bg-stone-50 rounded-xl transition-colors border border-stone-200"
-          >
-            <Download className="w-4 h-4" />
-            Export PDF
-          </button>
+          <div className="flex items-center gap-2">
+            <select
+              value={exportStatusFilter}
+              onChange={(e) => setExportStatusFilter(e.target.value as 'all' | Order['status'])}
+              className="px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]"
+            >
+              <option value="all">Export: All Status</option>
+              <option value="pending">Pending</option>
+              <option value="preparing">Preparing</option>
+              <option value="ready">Ready</option>
+              <option value="completed">Completed</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+            <button
+              onClick={() => exportOrdersToPDF(exportReadyOrders(filteredOrders), users, user)}
+              className="flex items-center gap-2 px-4 py-2 text-sm text-stone-600 hover:bg-stone-50 rounded-xl transition-colors border border-stone-200"
+            >
+              <Download className="w-4 h-4" />
+              Export PDF
+            </button>
+          </div>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full">
@@ -1454,6 +1772,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
                 <th className="px-6 py-3 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">Order</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">Customer</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">Type</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">Payment</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">Total</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">Status</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">Actions</th>
@@ -1465,7 +1784,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
                   <td className="px-6 py-4">
                     <div>
                       <p className="font-medium text-stone-800">{order.order_number}</p>
-                      <p className="text-xs text-stone-400">{new Date(order.created_at).toLocaleDateString()}</p>
+                      <p className="text-xs text-stone-400">{new Date(order.created_at).toLocaleString()}</p>
                     </div>
                   </td>
                   <td className="px-6 py-4">
@@ -1479,7 +1798,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
                       </div>
                       <div>
                         <p className="text-sm font-medium text-stone-800">{users.find(u => u.id === order.user_id)?.full_name || 'Walk-in Customer'}</p>
-                        <p className="text-xs text-stone-400">ID: {order.user_id?.slice(0, 8) || 'N/A'}</p>
+                        <p className="text-xs text-stone-400">{users.find(u => u.id === order.user_id)?.email || `ID: ${order.user_id?.slice(0, 8) || 'N/A'}`}</p>
                       </div>
                     </div>
                   </td>
@@ -1488,8 +1807,14 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
                       order.order_type === 'walkin' ? 'bg-green-50 text-green-600' :
                       'bg-purple-50 text-purple-600'
                     }`}>
-                      {order.order_type}
+                      {order.order_type === 'walkin' ? 'Walk-in' : 'QR/Online'}
                     </span>
+                  </td>
+                  <td className="px-6 py-4">
+                    <div className="text-xs">
+                      <p className="font-semibold text-stone-700 uppercase">{paymentByOrderId[order.id]?.method || 'Unpaid'}</p>
+                      <p className="text-stone-500">{paymentByOrderId[order.id]?.status || 'pending'}</p>
+                    </div>
                   </td>
                   <td className="px-6 py-4 font-mono text-sm font-bold text-stone-800">
                     ₱{order.total.toFixed(2)}
@@ -1581,7 +1906,16 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     <div className="space-y-6">
       <div className="bg-white rounded-2xl border border-stone-100 p-6">
         <div className="flex flex-col md:flex-row gap-4">
-          <div className="flex-1" />
+          <div className="flex-1 relative">
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-stone-400" />
+            <input
+              type="text"
+              placeholder="Search products..."
+              value={productSearchTerm}
+              onChange={(e) => setProductSearchTerm(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]"
+            />
+          </div>
           <div className="flex items-center gap-2">
             <Filter className="w-5 h-5 text-stone-400" />
             <select
@@ -1622,7 +1956,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
               </tr>
             </thead>
             <tbody className="divide-y divide-stone-100">
-              {filteredProducts.map((product) => {
+              {pagedProducts.map((product) => {
                 const inventoryItem = inventory.find(item => item.product_id === product.id);
                 const isLowStock = inventoryItem && inventoryItem.quantity <= inventoryItem.low_stock_threshold;
                 
@@ -1693,15 +2027,46 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
             </tbody>
           </table>
         </div>
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-6 py-4 border-t border-stone-100 bg-stone-50/60">
+          <p className="text-sm text-stone-500">
+            {filteredProducts.length === 0
+              ? 'No products to show'
+              : `Showing ${(productsPage - 1) * TABLE_PAGE_SIZE + 1}–${Math.min(productsPage * TABLE_PAGE_SIZE, filteredProducts.length)} of ${filteredProducts.length}`}
+          </p>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={() => setProductsPage(p => Math.max(1, p - 1))} disabled={productsPage <= 1 || filteredProducts.length === 0} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-xl border border-stone-200 bg-white text-stone-700 hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"><ChevronLeft className="w-4 h-4" />Back</button>
+            <button type="button" onClick={() => setProductsPage(p => Math.min(productsTotalPages, p + 1))} disabled={productsPage >= productsTotalPages || filteredProducts.length === 0} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-xl border border-stone-200 bg-white text-stone-700 hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">Next<ChevronRight className="w-4 h-4" /></button>
+          </div>
+        </div>
       </div>
     </div>
   );
 
   const usersTab = (
     <div className="space-y-6">
+      <div className="bg-white rounded-2xl border border-stone-100 p-6">
+        <div className="flex flex-col md:flex-row gap-4">
+          <div className="flex-1 relative">
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-stone-400" />
+            <input
+              type="text"
+              placeholder="Search users..."
+              value={userSearchTerm}
+              onChange={(e) => setUserSearchTerm(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]"
+            />
+          </div>
+          <select value={userRoleFilter} onChange={(e) => setUserRoleFilter(e.target.value as any)} className="px-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]">
+            <option value="all">All Roles</option>
+            <option value="admin">Admin</option>
+            <option value="staff">Staff</option>
+            <option value="client">Client</option>
+          </select>
+        </div>
+      </div>
       <div className="bg-white rounded-2xl border border-stone-100 overflow-hidden">
         <div className="p-6 border-b border-stone-100 flex items-center justify-between">
-          <h3 className="text-lg font-bold text-stone-800">Users ({users.length})</h3>
+          <h3 className="text-lg font-bold text-stone-800">Users ({filteredUsers.length})</h3>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full">
@@ -1714,7 +2079,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
               </tr>
             </thead>
             <tbody className="divide-y divide-stone-100">
-              {users.map((u) => (
+              {pagedUsers.map((u) => (
                 <tr key={u.id} className="hover:bg-stone-50">
                   <td className="px-6 py-4">
                     <div className="flex items-center gap-3">
@@ -1748,6 +2113,15 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
               ))}
             </tbody>
           </table>
+        </div>
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-6 py-4 border-t border-stone-100 bg-stone-50/60">
+          <p className="text-sm text-stone-500">
+            {filteredUsers.length === 0 ? 'No users to show' : `Showing ${(usersPage - 1) * TABLE_PAGE_SIZE + 1}–${Math.min(usersPage * TABLE_PAGE_SIZE, filteredUsers.length)} of ${filteredUsers.length}`}
+          </p>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={() => setUsersPage(p => Math.max(1, p - 1))} disabled={usersPage <= 1 || filteredUsers.length === 0} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-xl border border-stone-200 bg-white text-stone-700 hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"><ChevronLeft className="w-4 h-4" />Back</button>
+            <button type="button" onClick={() => setUsersPage(p => Math.min(usersTotalPages, p + 1))} disabled={usersPage >= usersTotalPages || filteredUsers.length === 0} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-xl border border-stone-200 bg-white text-stone-700 hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">Next<ChevronRight className="w-4 h-4" /></button>
+          </div>
         </div>
       </div>
     </div>
@@ -1803,6 +2177,25 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
         </div>
       </div>
 
+      <div className="bg-white rounded-2xl border border-stone-100 p-6">
+        <div className="flex flex-col md:flex-row gap-4">
+          <div className="flex-1 relative">
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-stone-400" />
+            <input
+              type="text"
+              placeholder="Search promos..."
+              value={promoSearchTerm}
+              onChange={(e) => setPromoSearchTerm(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]"
+            />
+          </div>
+          <select value={promoStatusFilter} onChange={(e) => setPromoStatusFilter(e.target.value as any)} className="px-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]">
+            <option value="all">All Status</option>
+            <option value="active">Active</option>
+            <option value="inactive">Inactive</option>
+          </select>
+        </div>
+      </div>
       <div className="bg-white rounded-2xl border border-stone-100 overflow-hidden">
         <div className="p-6 border-b border-stone-100 flex items-center justify-between">
           <h3 className="text-lg font-bold text-stone-800">Inventory ({filteredInventory.length})</h3>
@@ -1912,7 +2305,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
               </tr>
             </thead>
             <tbody className="divide-y divide-stone-100">
-              {promos.map((promo) => (
+              {pagedPromos.map((promo) => (
                 <tr key={promo.id} className="hover:bg-stone-50">
                   <td className="px-6 py-4">
                     <p className="font-medium text-stone-800">{promo.product_name}</p>
@@ -1954,6 +2347,15 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
               ))}
             </tbody>
           </table>
+        </div>
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-6 py-4 border-t border-stone-100 bg-stone-50/60">
+          <p className="text-sm text-stone-500">
+            {filteredPromos.length === 0 ? 'No promos to show' : `Showing ${(promosPage - 1) * TABLE_PAGE_SIZE + 1}–${Math.min(promosPage * TABLE_PAGE_SIZE, filteredPromos.length)} of ${filteredPromos.length}`}
+          </p>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={() => setPromosPage(p => Math.max(1, p - 1))} disabled={promosPage <= 1 || filteredPromos.length === 0} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-xl border border-stone-200 bg-white text-stone-700 hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"><ChevronLeft className="w-4 h-4" />Back</button>
+            <button type="button" onClick={() => setPromosPage(p => Math.min(promosTotalPages, p + 1))} disabled={promosPage >= promosTotalPages || filteredPromos.length === 0} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-xl border border-stone-200 bg-white text-stone-700 hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">Next<ChevronRight className="w-4 h-4" /></button>
+          </div>
         </div>
       </div>
     </div>
@@ -2310,12 +2712,18 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
           Audit trail from admin and staff actions (orders, inventory, products, promos).
         </p>
       </div>
+      <div className="bg-white rounded-2xl border border-stone-100 p-6">
+        <div className="flex-1 relative">
+          <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-stone-400" />
+          <input type="text" placeholder="Search activity..." value={activitySearchTerm} onChange={(e) => setActivitySearchTerm(e.target.value)} className="w-full pl-10 pr-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]" />
+        </div>
+      </div>
       <div className="bg-white rounded-2xl border border-stone-100 overflow-hidden">
-        {adminLogs.length === 0 ? (
+        {filteredActivities.length === 0 ? (
           <div className="p-12 text-center text-stone-500 text-sm">No activity recorded yet.</div>
         ) : (
           <ul className="divide-y divide-stone-100">
-            {adminLogs.map((log) => {
+            {pagedActivities.map((log) => {
               const actor = resolveProfileLabel(log.user_id);
               const when = new Date(log.created_at);
               return (
@@ -2353,6 +2761,15 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
             })}
           </ul>
         )}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-6 py-4 border-t border-stone-100 bg-stone-50/60">
+          <p className="text-sm text-stone-500">
+            {filteredActivities.length === 0 ? 'No activities to show' : `Showing ${(activitiesPage - 1) * TABLE_PAGE_SIZE + 1}–${Math.min(activitiesPage * TABLE_PAGE_SIZE, filteredActivities.length)} of ${filteredActivities.length}`}
+          </p>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={() => setActivitiesPage(p => Math.max(1, p - 1))} disabled={activitiesPage <= 1 || filteredActivities.length === 0} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-xl border border-stone-200 bg-white text-stone-700 hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"><ChevronLeft className="w-4 h-4" />Back</button>
+            <button type="button" onClick={() => setActivitiesPage(p => Math.min(activitiesTotalPages, p + 1))} disabled={activitiesPage >= activitiesTotalPages || filteredActivities.length === 0} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-xl border border-stone-200 bg-white text-stone-700 hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">Next<ChevronRight className="w-4 h-4" /></button>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -2365,8 +2782,23 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
           Recent successful sign-ins to the admin or staff portal (password, Google, or magic link via email).
         </p>
       </div>
+      <div className="bg-white rounded-2xl border border-stone-100 p-6">
+        <div className="flex flex-col md:flex-row gap-4">
+          <div className="flex-1 relative">
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-stone-400" />
+            <input type="text" placeholder="Search login logs..." value={loginSearchTerm} onChange={(e) => setLoginSearchTerm(e.target.value)} className="w-full pl-10 pr-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]" />
+          </div>
+          <select value={loginMethodFilter} onChange={(e) => setLoginMethodFilter(e.target.value as any)} className="px-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]">
+            <option value="all">All Methods</option>
+            <option value="email">Email</option>
+            <option value="google">Google</option>
+            <option value="github">GitHub</option>
+            <option value="apple">Apple</option>
+          </select>
+        </div>
+      </div>
       <div className="bg-white rounded-2xl border border-stone-100 overflow-hidden">
-        {loginLogs.length === 0 ? (
+        {filteredLoginLogs.length === 0 ? (
           <div className="p-12 text-center space-y-2">
             <p className="text-stone-500 text-sm">No login events yet.</p>
             <p className="text-xs text-stone-400 max-w-md mx-auto">
@@ -2385,7 +2817,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
                 </tr>
               </thead>
               <tbody className="divide-y divide-stone-100">
-                {loginLogs.map((row) => {
+                {pagedLoginLogs.map((row) => {
                   const p = users.find(u => u.id === row.user_id);
                   const roleLabel = p?.role === 'admin' ? 'Admin' : p?.role === 'staff' ? 'Staff' : p?.role ?? '—';
                   const when = new Date(row.created_at);
@@ -2432,6 +2864,214 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
             </table>
           </div>
         )}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-6 py-4 border-t border-stone-100 bg-stone-50/60">
+          <p className="text-sm text-stone-500">
+            {filteredLoginLogs.length === 0 ? 'No login logs to show' : `Showing ${(loginLogsPage - 1) * TABLE_PAGE_SIZE + 1}–${Math.min(loginLogsPage * TABLE_PAGE_SIZE, filteredLoginLogs.length)} of ${filteredLoginLogs.length}`}
+          </p>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={() => setLoginLogsPage(p => Math.max(1, p - 1))} disabled={loginLogsPage <= 1 || filteredLoginLogs.length === 0} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-xl border border-stone-200 bg-white text-stone-700 hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"><ChevronLeft className="w-4 h-4" />Back</button>
+            <button type="button" onClick={() => setLoginLogsPage(p => Math.min(loginLogsTotalPages, p + 1))} disabled={loginLogsPage >= loginLogsTotalPages || filteredLoginLogs.length === 0} className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-xl border border-stone-200 bg-white text-stone-700 hover:bg-stone-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">Next<ChevronRight className="w-4 h-4" /></button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  const analyticsTab = (
+    <div className="space-y-6">
+      <div className="bg-white rounded-2xl border border-stone-100 p-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div>
+          <h3 className="text-lg font-bold text-stone-800">Analytics & Reports</h3>
+          <p className="text-sm text-stone-500 mt-1">Export sales performance by day, week, month, or year.</p>
+        </div>
+        <div className="flex items-center gap-3">
+          <select value={analyticsPeriod} onChange={(e) => setAnalyticsPeriod(e.target.value as any)} className="px-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]">
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+            <option value="monthly">Monthly</option>
+            <option value="yearly">Yearly</option>
+          </select>
+          {analyticsPeriod === 'daily' && (
+            <input
+              type="date"
+              value={analyticsDayFilter}
+              onChange={(e) => setAnalyticsDayFilter(e.target.value)}
+              className="px-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]"
+            />
+          )}
+          {analyticsPeriod === 'weekly' && (
+            <input
+              type="week"
+              value={analyticsWeekFilter}
+              onChange={(e) => setAnalyticsWeekFilter(e.target.value)}
+              className="px-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]"
+            />
+          )}
+          {analyticsPeriod === 'monthly' && (
+            <input
+              type="month"
+              value={analyticsMonthFilter}
+              onChange={(e) => setAnalyticsMonthFilter(e.target.value)}
+              className="px-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]"
+            />
+          )}
+          {analyticsPeriod === 'yearly' && (
+            <input
+              type="number"
+              min={2000}
+              max={2100}
+              value={analyticsYearFilter}
+              onChange={(e) => setAnalyticsYearFilter(e.target.value)}
+              className="w-28 px-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]"
+            />
+          )}
+          <select
+            value={exportStatusFilter}
+            onChange={(e) => setExportStatusFilter(e.target.value as 'all' | Order['status'])}
+            className="px-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]"
+          >
+            <option value="all">All Status</option>
+            <option value="pending">Pending</option>
+            <option value="preparing">Preparing</option>
+            <option value="ready">Ready</option>
+            <option value="completed">Completed</option>
+            <option value="cancelled">Cancelled</option>
+          </select>
+          <button
+            onClick={() => exportOrdersToPDF(exportReadyOrders(analyticsScopedOrders), users, user)}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-[#7b6a6c] text-white rounded-xl hover:bg-[#6a5a5c] transition-colors"
+          >
+            <FileSpreadsheet className="w-4 h-4" />
+            Export PDF ({analyticsPeriod})
+          </button>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+        <div className="bg-white rounded-2xl border border-stone-100 p-5">
+          <p className="text-xs uppercase tracking-wider text-stone-500 font-semibold">Total Orders</p>
+          <p className="text-2xl font-bold text-stone-800 mt-2">{analyticsScopedOrders.length}</p>
+        </div>
+        <div className="bg-white rounded-2xl border border-stone-100 p-5">
+          <p className="text-xs uppercase tracking-wider text-stone-500 font-semibold">Completed Revenue</p>
+          <p className="text-2xl font-bold text-stone-800 mt-2">
+            ₱{analyticsScopedOrders.filter(o => o.status === 'completed').reduce((sum, o) => sum + Number(o.total || 0), 0).toFixed(2)}
+          </p>
+        </div>
+        <div className="bg-white rounded-2xl border border-stone-100 p-5">
+          <p className="text-xs uppercase tracking-wider text-stone-500 font-semibold">Average Order Value</p>
+          <p className="text-2xl font-bold text-stone-800 mt-2">
+            ₱{(
+              (analyticsScopedOrders.length ? analyticsScopedOrders.reduce((sum, o) => sum + Number(o.total || 0), 0) / analyticsScopedOrders.length : 0)
+            ).toFixed(2)}
+          </p>
+        </div>
+        <div className="bg-white rounded-2xl border border-stone-100 p-5">
+          <p className="text-xs uppercase tracking-wider text-stone-500 font-semibold">Cancellation Rate</p>
+          <p className="text-2xl font-bold text-stone-800 mt-2">
+            {analyticsScopedOrders.length ? ((analyticsScopedOrders.filter(o => o.status === 'cancelled').length / analyticsScopedOrders.length) * 100).toFixed(1) : '0.0'}%
+          </p>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+        <div className="bg-white rounded-2xl border border-stone-100 overflow-hidden">
+          <div className="px-6 py-4 border-b border-stone-100">
+            <h4 className="font-bold text-stone-800">Payment Method Mix</h4>
+          </div>
+          <div className="p-6 space-y-4">
+            {(['cash', 'card', 'gcash', 'paymaya'] as const).map((method) => {
+              const count = payments.filter(p => p.method === method).length;
+              const percent = payments.length ? (count / payments.length) * 100 : 0;
+              return (
+                <div key={method}>
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="font-medium text-stone-700 uppercase">{method}</span>
+                    <span className="text-stone-500">{count} ({percent.toFixed(1)}%)</span>
+                  </div>
+                  <div className="mt-1 h-2 rounded-full bg-stone-100 overflow-hidden">
+                    <div className="h-full bg-[#7b6a6c]" style={{ width: `${percent}%` }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        <div className="bg-white rounded-2xl border border-stone-100 overflow-hidden">
+          <div className="px-6 py-4 border-b border-stone-100">
+            <h4 className="font-bold text-stone-800">Order Type Mix</h4>
+          </div>
+          <div className="p-6 space-y-4">
+            {(['walkin', 'qr'] as const).map((type) => {
+              const count = analyticsScopedOrders.filter(o => o.order_type === type).length;
+              const percent = analyticsScopedOrders.length ? (count / analyticsScopedOrders.length) * 100 : 0;
+              return (
+                <div key={type}>
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="font-medium text-stone-700">{type === 'walkin' ? 'Walk-in' : 'QR/Online'}</span>
+                    <span className="text-stone-500">{count} ({percent.toFixed(1)}%)</span>
+                  </div>
+                  <div className="mt-1 h-2 rounded-full bg-stone-100 overflow-hidden">
+                    <div className="h-full bg-emerald-600" style={{ width: `${percent}%` }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+      <div className="bg-white rounded-2xl border border-stone-100 overflow-hidden">
+        <div className="px-6 py-4 border-b border-stone-100">
+          <h4 className="font-bold text-stone-800">Period Breakdown ({analyticsPeriod})</h4>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead className="bg-stone-50 border-b border-stone-100">
+              <tr>
+                <th className="px-6 py-3 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">Period</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">Total Orders</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">Completed</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-stone-500 uppercase tracking-wider">Completed Revenue</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-stone-100">
+              {Object.entries(
+                analyticsScopedOrders.reduce<Record<string, { orders: number; completed: number; revenue: number }>>((acc, order) => {
+                  const date = new Date(order.created_at);
+                  const periodKey =
+                    analyticsPeriod === 'daily'
+                      ? date.toISOString().slice(0, 10)
+                      : analyticsPeriod === 'weekly'
+                        ? (() => {
+                            const d = new Date(date);
+                            const day = d.getDay();
+                            const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+                            d.setDate(diff);
+                            return `Week of ${d.toISOString().slice(0, 10)}`;
+                          })()
+                        : analyticsPeriod === 'monthly'
+                          ? `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
+                          : `${date.getFullYear()}`;
+                  if (!acc[periodKey]) acc[periodKey] = { orders: 0, completed: 0, revenue: 0 };
+                  acc[periodKey].orders += 1;
+                  if (order.status === 'completed') {
+                    acc[periodKey].completed += 1;
+                    acc[periodKey].revenue += Number(order.total || 0);
+                  }
+                  return acc;
+                }, {})
+              )
+                .sort((a, b) => b[0].localeCompare(a[0]))
+                .slice(0, 12)
+                .map(([period, values]) => (
+                  <tr key={period} className="hover:bg-stone-50">
+                    <td className="px-6 py-4 text-sm font-medium text-stone-800">{period}</td>
+                    <td className="px-6 py-4 text-sm text-stone-700">{values.orders}</td>
+                    <td className="px-6 py-4 text-sm text-stone-700">{values.completed}</td>
+                    <td className="px-6 py-4 text-sm font-semibold text-stone-800">₱{values.revenue.toFixed(2)}</td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
@@ -2444,9 +3084,9 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     { id: 'users', label: 'Users', icon: Users },
     { id: 'inventory', label: 'Inventory', icon: Target },
     { id: 'promos', label: 'Promos', icon: Zap },
+    { id: 'analytics', label: 'Analytics', icon: FileSpreadsheet },
     ...(!isStaff ? [{ id: 'activities', label: 'Recent activities', icon: History }] : []),
     ...(!isStaff ? [{ id: 'login_logs', label: 'Login logs', icon: KeyRound }] : []),
-    ...(!isStaff ? [{ id: 'permissions', label: 'Rollback Permissions', icon: Shield }] : []),
   ];
 
   if (loading) {
@@ -2570,6 +3210,63 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
           </div>
           
           <div className="flex items-center gap-3">
+            <div className="relative" ref={notificationMenuRef}>
+              <button
+                onClick={() => setShowNotificationMenu((prev) => !prev)}
+                className="relative p-2 hover:bg-stone-100 rounded-lg transition-colors"
+                title="Notifications"
+                aria-label="Open notifications"
+              >
+                <Bell className="w-5 h-5 text-stone-600" />
+                {dashboardNotifications.length > 0 && (
+                  <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 bg-[#7b6a6c] text-white text-[10px] font-bold rounded-full flex items-center justify-center">
+                    {dashboardNotifications.length}
+                  </span>
+                )}
+              </button>
+
+              <AnimatePresence>
+                {showNotificationMenu && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -6, scale: 0.98 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: -6, scale: 0.98 }}
+                    className="absolute right-0 mt-2 w-96 max-w-[calc(100vw-2rem)] bg-white border border-stone-200 rounded-2xl shadow-2xl shadow-stone-200 overflow-hidden z-[70]"
+                  >
+                    <div className="px-4 py-3 border-b border-stone-100 flex items-center justify-between">
+                      <p className="text-sm font-bold text-stone-800">Notifications</p>
+                      <p className="text-xs text-stone-500">Max 5</p>
+                    </div>
+
+                    <div className="max-h-80 overflow-y-auto">
+                      {dashboardNotifications.length === 0 ? (
+                        <div className="px-4 py-6 text-sm text-stone-500 text-center">No notifications yet.</div>
+                      ) : (
+                        dashboardNotifications.map((notif) => (
+                          <div key={notif.id} className="px-4 py-3 border-b border-stone-100 last:border-b-0 hover:bg-stone-50 transition-colors">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="text-sm font-semibold text-stone-800">{notif.title}</p>
+                                <p className="text-xs text-stone-500 mt-1">{notif.message}</p>
+                              </div>
+                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold whitespace-nowrap ${
+                                notif.tone === 'success'
+                                  ? 'bg-emerald-100 text-emerald-700'
+                                  : notif.tone === 'warning'
+                                    ? 'bg-amber-100 text-amber-700'
+                                    : 'bg-blue-100 text-blue-700'
+                              }`}>
+                                {notif.timeLabel}
+                              </span>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
             <button 
               onClick={refreshData}
               className="p-2 hover:bg-stone-100 rounded-lg transition-colors"
@@ -2611,9 +3308,6 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
                   <span className="font-medium">{tab.label}</span>
                   {restricted && (
                     <Lock className="w-3 h-3 text-red-500" />
-                  )}
-                  {tab.id === 'permissions' && (
-                    <span className="ml-1 px-1.5 py-0.5 bg-purple-100 text-purple-700 text-[10px] font-bold rounded-full">Admin</span>
                   )}
                 </button>
               );
@@ -2667,9 +3361,9 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
                 {activeTab === 'users' && usersTab}
                 {activeTab === 'inventory' && inventoryTab}
                 {activeTab === 'promos' && promosTab}
+                {activeTab === 'analytics' && analyticsTab}
                 {activeTab === 'activities' && !isStaff && recentActivitiesTab}
                 {activeTab === 'login_logs' && !isStaff && loginLogsTab}
-                {activeTab === 'permissions' && !isStaff && rollbackPermissionsTab}
               </>
             )}
           </motion.div>
@@ -3152,15 +3846,21 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
                 <div>
                   <p className="text-sm text-stone-500 mb-3">Order Items</p>
                   <div className="space-y-2">
-                    {orderItems.map((item) => (
-                      <div key={item.id} className="flex items-center justify-between p-3 bg-stone-50 rounded-lg">
-                        <div>
-                          <p className="font-medium text-stone-800">{item.product_name}</p>
-                          <p className="text-xs text-stone-500">Qty: {item.quantity} • ₱{item.unit_price.toFixed(2)} each</p>
+                    {orderItemsLoading ? (
+                      <p className="text-sm text-stone-500">Loading order items...</p>
+                    ) : orderItems.length === 0 ? (
+                      <p className="text-sm text-stone-500">No items found for this order.</p>
+                    ) : (
+                      orderItems.map((item) => (
+                        <div key={item.id} className="flex items-center justify-between p-3 bg-stone-50 rounded-lg">
+                          <div>
+                            <p className="font-medium text-stone-800">{item.product_name}</p>
+                            <p className="text-xs text-stone-500">Qty: {item.quantity} • ₱{item.unit_price.toFixed(2)} each</p>
+                          </div>
+                          <p className="font-mono font-bold text-stone-800">₱{item.line_total.toFixed(2)}</p>
                         </div>
-                        <p className="font-mono font-bold text-stone-800">₱{item.line_total.toFixed(2)}</p>
-                      </div>
-                    ))}
+                      ))
+                    )}
                   </div>
                 </div>
               </div>
