@@ -708,6 +708,11 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
 
   const { orderItems, loading: orderItemsLoading, getOrderItems } = useOrderManagement();
 
+  // Used by the "Order Details" modal (opened from Overview/Orders lists).
+  const selectedClient = selectedOrder?.user_id
+    ? users.find((u) => u.id === selectedOrder.user_id) || null
+    : null;
+
   // Detect orders that just became "ready" and show toast notification
   useEffect(() => {
     const prev = prevOrderStatusesRef.current;
@@ -756,6 +761,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     const readyCount = orders.filter((order) => order.status === 'ready').length;
     const pendingCount = orders.filter((order) => order.status === 'pending' || order.status === 'preparing').length;
     const lowStockCount = inventory.filter((item) => item.quantity <= item.low_stock_threshold).length;
+    const outOfStockCount = inventory.filter((item) => item.quantity === 0).length;
     const activePromoCount = promos.filter((promo) => promo.is_active).length;
 
     const dynamicReady = readyNotifications
@@ -790,11 +796,17 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
       },
       {
         id: 'inventory-alert',
-        title: lowStockCount > 0 ? 'Low Stock Alert' : 'Inventory Healthy',
-        message: lowStockCount > 0
-          ? `${lowStockCount} item${lowStockCount > 1 ? 's are' : ' is'} below threshold.`
-          : 'All tracked items are above low-stock threshold.',
-        tone: lowStockCount > 0 ? 'warning' : 'info',
+        title: outOfStockCount > 0
+          ? 'Out of Stock Alert'
+          : lowStockCount > 0
+            ? 'Low Stock Alert'
+            : 'Inventory Healthy',
+        message: outOfStockCount > 0
+          ? `${outOfStockCount} item${outOfStockCount > 1 ? 's are' : ' is'} out of stock now.`
+          : lowStockCount > 0
+            ? `${lowStockCount} item${lowStockCount > 1 ? 's are' : ' is'} below threshold.`
+            : 'All tracked items are above low-stock threshold.',
+        tone: outOfStockCount > 0 || lowStockCount > 0 ? 'warning' : 'info',
         timeLabel: 'Live',
       },
       {
@@ -1045,6 +1057,69 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     setCounterCardCvc('');
   };
 
+  const applyStockDeduction = useCallback(async (items: CounterOrderSnapshot['items']) => {
+    const qtyByProductId = new Map<string, number>();
+    items.forEach((item) => {
+      if (!item.productId || item.quantity <= 0) return;
+      qtyByProductId.set(item.productId, (qtyByProductId.get(item.productId) || 0) + item.quantity);
+    });
+
+    const productIds = Array.from(qtyByProductId.keys());
+    if (productIds.length === 0) return;
+
+    const { supabase: sb } = await import('../supabase');
+
+    const { data: inventoryRows, error: inventoryFetchError } = await sb
+      .from('inventory')
+      .select('product_id, quantity, low_stock_threshold')
+      .in('product_id', productIds);
+    if (inventoryFetchError) throw inventoryFetchError;
+
+    const inventoryByProductId = new Map((inventoryRows || []).map((row: any) => [row.product_id, row]));
+    await Promise.all(productIds.map(async (productId) => {
+      const orderedQty = qtyByProductId.get(productId) || 0;
+      const existing = inventoryByProductId.get(productId);
+
+      if (!existing) {
+        const { error } = await sb.from('inventory').insert({
+          product_id: productId,
+          quantity: 0,
+          low_stock_threshold: 10,
+          updated_at: new Date().toISOString(),
+        });
+        if (error) throw error;
+        return;
+      }
+
+      const nextQty = Math.max(0, Number(existing.quantity || 0) - orderedQty);
+      const { error } = await sb
+        .from('inventory')
+        .update({ quantity: nextQty, updated_at: new Date().toISOString() })
+        .eq('product_id', productId);
+      if (error) throw error;
+    }));
+
+    const { data: productRows, error: productsFetchError } = await sb
+      .from('products')
+      .select('id, stock_quantity')
+      .in('id', productIds);
+    if (productsFetchError) throw productsFetchError;
+
+    await Promise.all((productRows || []).map(async (product: any) => {
+      const orderedQty = qtyByProductId.get(product.id) || 0;
+      const nextStock = Math.max(0, Number(product.stock_quantity || 0) - orderedQty);
+      const { error } = await sb
+        .from('products')
+        .update({
+          stock_quantity: nextStock,
+          is_available: nextStock > 0,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', product.id);
+      if (error) throw error;
+    }));
+  }, []);
+
   const commitCounterOrderFromSnapshot = useCallback(
     async (
       snapshot: CounterOrderSnapshot,
@@ -1093,10 +1168,12 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
       });
       if (payErr) throw payErr;
 
+      await applyStockDeduction(snapshot.items);
+
       refreshData();
       return orderNum;
     },
-    [refreshData],
+    [applyStockDeduction, refreshData],
   );
 
   const formatCounterCardDisplay = (raw: string) => {
@@ -1570,6 +1647,14 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
     return sourceOrders.filter((order) => order.status === exportStatusFilter);
   };
 
+  const statCardColorClasses: Record<string, string> = {
+    blue: 'bg-blue-50 text-blue-600',
+    green: 'bg-green-50 text-green-600',
+    yellow: 'bg-yellow-50 text-yellow-600',
+    red: 'bg-red-50 text-red-600',
+    purple: 'bg-purple-50 text-purple-600',
+  };
+
   const StatCard = ({ title, value, icon: Icon, trend, color = 'blue' }: any) => (
     <motion.div 
       initial={{ opacity: 0, y: 20 }}
@@ -1577,7 +1662,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
       className={`bg-white rounded-2xl p-6 border border-stone-100 hover:shadow-lg transition-all`}
     >
       <div className="flex items-center justify-between mb-4">
-        <div className={`w-12 h-12 bg-${color}-50 rounded-xl flex items-center justify-center text-${color}-600`}>
+        <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${statCardColorClasses[color] || statCardColorClasses.blue}`}>
           <Icon className="w-6 h-6" />
         </div>
         {trend && (
@@ -2177,25 +2262,6 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
         </div>
       </div>
 
-      <div className="bg-white rounded-2xl border border-stone-100 p-6">
-        <div className="flex flex-col md:flex-row gap-4">
-          <div className="flex-1 relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-stone-400" />
-            <input
-              type="text"
-              placeholder="Search promos..."
-              value={promoSearchTerm}
-              onChange={(e) => setPromoSearchTerm(e.target.value)}
-              className="w-full pl-10 pr-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]"
-            />
-          </div>
-          <select value={promoStatusFilter} onChange={(e) => setPromoStatusFilter(e.target.value as any)} className="px-4 py-2 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#7b6a6c]">
-            <option value="all">All Status</option>
-            <option value="active">Active</option>
-            <option value="inactive">Inactive</option>
-          </select>
-        </div>
-      </div>
       <div className="bg-white rounded-2xl border border-stone-100 overflow-hidden">
         <div className="p-6 border-b border-stone-100 flex items-center justify-between">
           <h3 className="text-lg font-bold text-stone-800">Inventory ({filteredInventory.length})</h3>
@@ -3827,6 +3893,12 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
                     <p className="font-medium text-stone-800">{selectedOrder.order_number}</p>
                   </div>
                   <div>
+                    <p className="text-sm text-stone-500">Client Name</p>
+                    <p className="font-medium text-stone-800">
+                      {selectedClient?.full_name || selectedClient?.email || 'Walk-in Customer'}
+                    </p>
+                  </div>
+                  <div>
                     <p className="text-sm text-stone-500">Status</p>
                     <span className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(selectedOrder.status)}`}>
                       {getStatusIcon(selectedOrder.status)}
@@ -3840,6 +3912,12 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ user, onLogout, mode = 
                   <div>
                     <p className="text-sm text-stone-500">Total Amount</p>
                     <p className="font-mono font-bold text-stone-800">₱{selectedOrder.total.toFixed(2)}</p>
+                  </div>
+                  <div>
+                    <p className="text-sm text-stone-500">Client Email</p>
+                    <p className="text-sm text-stone-400">
+                      {selectedClient?.email || 'N/A'}
+                    </p>
                   </div>
                 </div>
 

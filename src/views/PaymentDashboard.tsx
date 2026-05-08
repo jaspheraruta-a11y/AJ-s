@@ -368,6 +368,71 @@ async function awardPoints(userId: string, orderId: string, total: number): Prom
   return pointsEarned;
 }
 
+async function deductInventoryForCartItems(
+  cart: Array<{ id: string; quantity: number }>
+): Promise<void> {
+  const qtyByProductId = new Map<string, number>();
+  cart.forEach((item) => {
+    if (!item?.id || !item?.quantity || item.quantity <= 0) return;
+    qtyByProductId.set(item.id, (qtyByProductId.get(item.id) || 0) + item.quantity);
+  });
+
+  const productIds = Array.from(qtyByProductId.keys());
+  if (productIds.length === 0) return;
+
+  const { data: inventoryRows, error: inventoryFetchError } = await supabase
+    .from('inventory')
+    .select('product_id, quantity, low_stock_threshold')
+    .in('product_id', productIds);
+  if (inventoryFetchError) throw inventoryFetchError;
+
+  const inventoryByProductId = new Map((inventoryRows || []).map((row: any) => [row.product_id, row]));
+  const inventoryOps = productIds.map(async (productId) => {
+    const orderedQty = qtyByProductId.get(productId) || 0;
+    const existing = inventoryByProductId.get(productId);
+
+    if (!existing) {
+      const { error } = await supabase.from('inventory').insert({
+        product_id: productId,
+        quantity: 0,
+        low_stock_threshold: 10,
+        updated_at: new Date().toISOString(),
+      });
+      if (error) throw error;
+      return;
+    }
+
+    const nextQty = Math.max(0, Number(existing.quantity || 0) - orderedQty);
+    const { error } = await supabase
+      .from('inventory')
+      .update({ quantity: nextQty, updated_at: new Date().toISOString() })
+      .eq('product_id', productId);
+    if (error) throw error;
+  });
+  await Promise.all(inventoryOps);
+
+  const { data: productRows, error: productsFetchError } = await supabase
+    .from('products')
+    .select('id, stock_quantity')
+    .in('id', productIds);
+  if (productsFetchError) throw productsFetchError;
+
+  const productOps = (productRows || []).map(async (product: any) => {
+    const orderedQty = qtyByProductId.get(product.id) || 0;
+    const nextStock = Math.max(0, Number(product.stock_quantity || 0) - orderedQty);
+    const { error } = await supabase
+      .from('products')
+      .update({
+        stock_quantity: nextStock,
+        is_available: nextStock > 0,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', product.id);
+    if (error) throw error;
+  });
+  await Promise.all(productOps);
+}
+
 // ── Save order + payment to Supabase ───────────────────────────────────────
 async function saveOrder(pending: PendingOrder): Promise<number> {
   const orderNumber = 'ORD-' + Math.random().toString(36).substr(2, 6).toUpperCase();
@@ -402,6 +467,10 @@ async function saveOrder(pending: PendingOrder): Promise<number> {
 
   const { error: itemsError } = await supabase.from('order_items').insert(orderItemsToInsert);
   if (itemsError) throw itemsError;
+
+  await deductInventoryForCartItems(
+    pending.cart.map((item: any) => ({ id: item.id, quantity: Number(item.quantity || 0) }))
+  );
 
   // Map 'counter' to 'cash' — the DB enum only allows: cash | card | gcash | paymaya
   const dbMethod = pending.paymentMethod === 'counter' ? 'cash' : pending.paymentMethod;
